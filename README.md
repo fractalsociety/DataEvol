@@ -19,10 +19,12 @@ dataevol ingest --jsonl ./traces.jsonl
 dataevol label --run-id run_001
 dataevol score --run-id run_001
 dataevol compress --run-id run_001
-dataevol dataset build --type router
-dataevol benchmark build --from-runs last_100
+dataevol dataset build --type router --run-id run_001
+dataevol dataset router-performance --run-id run_001
+dataevol dataset candidate-router-policy --run-id run_001
+dataevol benchmark build --type router --from-runs last_100
 dataevol evolve reflect --run-id run_001
-dataevol evolve idea-prd --opportunity opp_001
+dataevol evolve idea-prd --opportunity-id 1
 dataevol evolve experiment --idea ./ideas/opp_001/IDEA_PRD.md --run-id run_001
 dataevol evolve compare --experiment exp_001
 dataevol evolve promote --experiment exp_001
@@ -30,7 +32,12 @@ dataevol evolve reject --experiment exp_001
 dataevol local-model prepare
 dataevol local-model train --execute
 dataevol privacy set private-local-only
+dataevol privacy export-candidates --run-id run_001
+dataevol prompt variants --pack '{"manager":"plan"}'
 dataevol report runs
+dataevol report opportunities
+dataevol report idea-prds
+dataevol report promotions
 dataevol serve
 ```
 

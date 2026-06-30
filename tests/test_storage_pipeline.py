@@ -126,3 +126,34 @@ def test_public_privacy_mode_can_export_candidate(tmp_path: Path) -> None:
     assert candidate["privacy_status"] == "public_benchmark"
     assert_public_export_allowed(candidate)
 
+
+def test_ingest_marks_near_duplicates_without_inserting_fresh_trace(tmp_path: Path) -> None:
+    jsonl_path = tmp_path / "near.jsonl"
+    _write_jsonl(
+        jsonl_path,
+        [
+            {
+                "trace_type": "coding_trace",
+                "task_id": "router-timeout-fix",
+                "prompt": "Fix router timeout test",
+                "response": "pytest passed",
+            },
+            {
+                "trace_type": "coding_trace",
+                "task_id": "router-timeout-fix",
+                "prompt": "Fix the router timeout test",
+                "response": "pytest passed",
+            },
+        ],
+    )
+    db_path = tmp_path / "dataevol.sqlite"
+    report = ingest_jsonl(jsonl_path, db_path, source_system="coordinate", raw_root=tmp_path / "raw")
+
+    assert report.accepted == 1
+    assert report.duplicates == 1
+    assert report.duplicate_hashes[0].startswith("near:")
+    with sqlite3.connect(db_path) as conn:
+        trace_count = conn.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
+        duplicate_events = conn.execute("SELECT COUNT(*) FROM duplicate_events").fetchone()[0]
+    assert trace_count == 1
+    assert duplicate_events == 1

@@ -43,12 +43,52 @@ def _write_trace_batch(config: DataEvolConfig, name: str, traces: list[dict[str,
 def _load_experiment_payload(payload: dict[str, Any], config: DataEvolConfig) -> dict[str, Any]:
     if isinstance(payload.get("report"), dict):
         return payload["report"]
+    report_path = payload.get("report_path")
+    if report_path and Path(str(report_path)).exists():
+        return json.loads(Path(str(report_path)).read_text(encoding="utf-8"))
     experiment_id = payload.get("experiment") or payload.get("experiment_id")
     if experiment_id:
+        if Path(str(experiment_id)).exists():
+            return json.loads(Path(str(experiment_id)).read_text(encoding="utf-8"))
         path = config.artifacts_path / "experiments" / f"{experiment_id}.report.json"
         if path.exists():
             return json.loads(path.read_text(encoding="utf-8"))
     return payload
+
+
+def _load_traces_payload(payload: dict[str, Any], config: DataEvolConfig) -> list[dict[str, Any]]:
+    if isinstance(payload.get("traces"), list):
+        return [dict(trace) for trace in payload["traces"]]
+    if payload.get("run_id") is not None or payload.get("from_runs"):
+        from dataevol.storage import load_trace_rows
+
+        run_id = _parse_run_id(payload["run_id"]) if payload.get("run_id") is not None else None
+        return load_trace_rows(config.db_path, run_id=run_id, from_runs=payload.get("from_runs"))
+    return []
+
+
+def _parse_opportunity_payload(payload: dict[str, Any], config: DataEvolConfig) -> tuple[dict[str, Any] | None, int | None]:
+    opportunity_id = payload.get("opportunity_id")
+    if opportunity_id is not None:
+        from dataevol.storage import load_opportunity
+
+        db_id = int(opportunity_id)
+        return load_opportunity(config.db_path, db_id), db_id
+    opportunity = payload.get("opportunity")
+    if isinstance(opportunity, dict):
+        return opportunity, payload.get("opportunity_db_id")
+    if isinstance(opportunity, str) and opportunity.strip():
+        text = opportunity.strip()
+        if Path(text).exists():
+            loaded = json.loads(Path(text).read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("opportunity JSON file must contain an object")
+            return loaded, payload.get("opportunity_db_id")
+        loaded = json.loads(text)
+        if not isinstance(loaded, dict):
+            raise ValueError("opportunity JSON must be an object")
+        return loaded, payload.get("opportunity_db_id")
+    return None, None
 
 
 def _call_known_operation(
@@ -137,49 +177,72 @@ def _call_known_operation(
 
     if function_name == "build_dataset":
         from dataevol.datasets import build_dataset, build_router_dataset
+        from dataevol.storage import register_dataset
 
         dataset_type = payload.get("type") or payload.get("dataset_type") or "router"
+        traces = _load_traces_payload(payload, config)
         if dataset_type == "router":
-            result = build_router_dataset(payload.get("traces") or [], config.artifacts_path / "datasets", privacy_mode=config.privacy_mode)
+            result = build_router_dataset(traces, config.artifacts_path / "datasets", privacy_mode=config.privacy_mode)
         else:
-            result = build_dataset(dataset_type, payload.get("traces") or [], config.artifacts_path / "datasets", privacy_mode=config.privacy_mode)
-        return _normalize_result(result, function_name)
+            result = build_dataset(dataset_type, traces, config.artifacts_path / "datasets", privacy_mode=config.privacy_mode)
+        normalized = _normalize_result(result, function_name)
+        normalized["db_dataset_id"] = register_dataset(config.db_path, result, traces=traces)
+        normalized["source_trace_count"] = len(traces)
+        return normalized
 
     if function_name == "build_benchmark":
         from dataevol.benchmarks import build_benchmark, build_frozen_benchmark
+        from dataevol.storage import register_benchmark
 
         benchmark_type = payload.get("type") or payload.get("benchmark_type")
+        items = payload.get("items")
+        if not isinstance(items, list):
+            items = _load_traces_payload(payload, config)
         if benchmark_type:
-            result = build_benchmark(benchmark_type, payload.get("items") or [], config.artifacts_path / "benchmarks", overwrite=True)
+            result = build_benchmark(benchmark_type, items, config.artifacts_path / "benchmarks", overwrite=True)
         else:
-            result = build_frozen_benchmark(payload.get("items") or [], config.artifacts_path / "benchmarks", source=str(payload.get("from_runs") or payload.get("source") or "unspecified"), overwrite=True)
-        return _normalize_result(result, function_name)
+            result = build_frozen_benchmark(items, config.artifacts_path / "benchmarks", source=str(payload.get("from_runs") or payload.get("source") or "unspecified"), overwrite=True)
+        normalized = _normalize_result(result, function_name)
+        normalized["db_benchmark_id"] = register_benchmark(config.db_path, result)
+        normalized["source_item_count"] = len(items)
+        return normalized
 
     if function_name == "reflect":
         from dataevol.evolve import detect_opportunities, save_learning_opportunities
-        from dataevol.evolve.context import load_evolution_context
 
         traces = payload.get("traces")
-        if traces is None and payload.get("run_id") is not None:
-            traces = load_evolution_context(config.db_path, _parse_run_id(payload["run_id"]))["traces"]
+        if traces is None:
+            traces = _load_traces_payload(payload, config)
         opportunities = detect_opportunities(traces or [])
         path = save_learning_opportunities(opportunities, config.artifacts_path / "evolution")
-        return _normalize_result({"opportunities": opportunities, "path": str(path)}, function_name)
+        from dataevol.storage import register_opportunities
+
+        run_id = _parse_run_id(payload["run_id"]) if payload.get("run_id") is not None else None
+        opportunity_ids = register_opportunities(config.db_path, opportunities, run_id=run_id)
+        for opportunity, db_id in zip(opportunities, opportunity_ids):
+            opportunity["db_id"] = db_id
+        return _normalize_result({"opportunities": opportunities, "path": str(path), "opportunity_ids": opportunity_ids}, function_name)
 
     if function_name == "idea_prd":
         from dataevol.evolve import generate_component_idea_prd, generate_idea_prd, save_idea_prd
+        from dataevol.storage import register_idea_prd
 
-        opportunity = payload.get("opportunity")
+        opportunity, opportunity_db_id = _parse_opportunity_payload(payload, config)
         if isinstance(opportunity, dict):
             component = str(payload.get("component") or "router")
             prd = generate_component_idea_prd(opportunity, component) if component in {"router", "prompt", "verifier", "local_model", "benchmark"} else generate_idea_prd(opportunity)
             path = save_idea_prd(prd, config.artifacts_path / "evolution" / "ideas", slug=str(opportunity.get("id") or "idea_prd"))
-            return {"ok": True, "status": "completed", "operation": function_name, "prd": prd, "path": str(path)}
+            if opportunity_db_id is None:
+                from dataevol.storage import register_opportunities
+
+                opportunity_db_id = register_opportunities(config.db_path, [opportunity])[0]
+            idea_prd_id = register_idea_prd(config.db_path, int(opportunity_db_id), path)
+            return {"ok": True, "status": "completed", "operation": function_name, "prd": prd, "path": str(path), "db_idea_prd_id": idea_prd_id, "db_opportunity_id": opportunity_db_id}
         return {
             "ok": False,
             "status": "error",
             "operation": function_name,
-            "detail": "opportunity must be a JSON object",
+            "detail": "opportunity must be a JSON object, JSON file path, or --opportunity-id",
         }
 
     if function_name == "synthetic_generate":
@@ -187,8 +250,92 @@ def _call_known_operation(
 
         return _normalize_result({"items": generate_synthetic_data(payload.get("traces") or [])}, function_name)
 
+    if module_name == "privacy" and function_name == "export_training_candidates":
+        from dataevol.privacy import export_training_candidates
+
+        traces = _load_traces_payload(payload, config)
+        result = export_training_candidates(
+            traces,
+            payload.get("output") or config.artifacts_path / "privacy",
+            public=bool(payload.get("public", False)),
+        )
+        return _normalize_result(result, function_name)
+
+    if module_name == "datasets" and function_name in {"router_performance", "candidate_router_policy"}:
+        from dataevol.datasets import build_router_performance_dataset, generate_candidate_router_policy
+
+        traces = _load_traces_payload(payload, config)
+        rows = build_router_performance_dataset(traces)
+        if function_name == "router_performance":
+            path = config.artifacts_path / "datasets" / "router_performance.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            return _normalize_result({"rows": rows, "path": str(path), "source_trace_count": len(traces)}, function_name)
+        policy = generate_candidate_router_policy(rows)
+        path = config.artifacts_path / "evolution" / "candidate_router_policy.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return _normalize_result({"policy": policy, "path": str(path), "source_trace_count": len(traces)}, function_name)
+
+    if module_name in {"prompts", "prompt"}:
+        from dataevol.prompts import ab_test_prompt_packs, generate_candidate_prompt_pack, promote_prompt_pack, version_prompt_pack
+
+        if function_name in {"variants", "candidate"}:
+            pack = payload.get("pack")
+            if not isinstance(pack, dict) and payload.get("pack_path"):
+                pack = json.loads(Path(payload["pack_path"]).read_text(encoding="utf-8"))
+                if "prompts" in pack and isinstance(pack["prompts"], dict):
+                    pack = pack["prompts"]
+            if not isinstance(pack, dict):
+                raise ValueError("pack must be a JSON object or --pack-path containing prompts")
+            return _normalize_result({"pack": generate_candidate_prompt_pack(pack)}, function_name)
+        if function_name == "version":
+            pack = payload.get("pack")
+            if not isinstance(pack, dict) and payload.get("pack_path"):
+                pack = json.loads(Path(payload["pack_path"]).read_text(encoding="utf-8"))
+                if "prompts" in pack and isinstance(pack["prompts"], dict):
+                    pack = pack["prompts"]
+            if not isinstance(pack, dict):
+                raise ValueError("pack must be a JSON object or --pack-path containing prompts")
+            path = version_prompt_pack(pack, payload.get("output") or config.artifacts_path / "prompts", version=str(payload.get("version") or "v1"))
+            return _normalize_result({"path": str(path)}, function_name)
+        if function_name == "ab_test":
+            result = ab_test_prompt_packs(payload.get("control_metrics") or {}, payload.get("variant_metrics") or {})
+            return _normalize_result(result, function_name)
+        if function_name == "promote":
+            result = payload.get("test_result") or payload
+            path = promote_prompt_pack(result, payload.get("output") or config.artifacts_path / "prompts")
+            return _normalize_result({"path": str(path), "promoted": True}, function_name)
+
+    if module_name == "integrations":
+        from dataevol.integrations import coordinate_completion_payload, post_coordinate_completion, router_dataset_pull
+
+        if function_name == "coordinate_payload":
+            return _normalize_result(coordinate_completion_payload(payload.get("run") or payload), function_name)
+        if function_name == "post_coordinate_completion":
+            return _normalize_result(
+                post_coordinate_completion(
+                    str(payload["endpoint"]),
+                    payload.get("run") or {},
+                    token=payload.get("token"),
+                    timeout=int(payload.get("timeout") or 30),
+                ),
+                function_name,
+            )
+        if function_name == "router_dataset_pull":
+            return _normalize_result(
+                router_dataset_pull(
+                    payload.get("manifest") or payload.get("dataset_manifest") or config.artifacts_path / "datasets" / "router_dataset.manifest.json",
+                    endpoint=payload.get("endpoint"),
+                    token=payload.get("token"),
+                    timeout=int(payload.get("timeout") or 30),
+                ),
+                function_name,
+            )
+
     if function_name == "experiment":
         from dataevol.experiments import create_rollback_snapshot, run_measured_router_policy_experiment, run_router_policy_experiment
+        from dataevol.storage import ensure_idea_prd, register_benchmark_path, register_experiment_report
 
         rollback = payload.get("rollback_snapshot")
         if not rollback:
@@ -205,7 +352,17 @@ def _call_known_operation(
                 rollback_snapshot=str(rollback),
                 variant_provider=str(payload.get("variant_provider") or "openrouter"),
             )
-        return _normalize_result(result, function_name)
+        idea_prd_id = None
+        if payload.get("idea"):
+            idea_prd_id = ensure_idea_prd(config.db_path, path=payload.get("idea"))
+        benchmark_id = None
+        if result.get("benchmark_path"):
+            benchmark_id = register_benchmark_path(config.db_path, result["benchmark_path"], result.get("benchmark_manifest_path"))
+        normalized = _normalize_result(result, function_name)
+        normalized["db_experiment_id"] = register_experiment_report(config.db_path, result, idea_prd_id=idea_prd_id, benchmark_id=benchmark_id)
+        if benchmark_id is not None:
+            normalized["db_benchmark_id"] = benchmark_id
+        return normalized
 
     if function_name == "compare":
         from dataevol.experiments import compare_experiment
@@ -215,10 +372,15 @@ def _call_known_operation(
     if function_name == "promote":
         from dataevol.promotion import PromotionRejected
         from dataevol.experiments import promote_experiment
+        from dataevol.storage import register_promotion
 
         report = _load_experiment_payload(payload, config)
         try:
-            return _normalize_result(promote_experiment(report, config.artifacts_path / "promotions"), function_name)
+            result = promote_experiment(report, config.artifacts_path / "promotions")
+            normalized = _normalize_result(result, function_name)
+            if result.get("promotion_path"):
+                normalized["db_promotion_id"] = register_promotion(config.db_path, result["promotion_path"], report)
+            return normalized
         except PromotionRejected as exc:
             return {
                 "ok": False,
@@ -230,8 +392,18 @@ def _call_known_operation(
 
     if function_name == "reject":
         from dataevol.experiments import reject_experiment
+        from dataevol.storage import find_experiment_db_id
 
-        return _normalize_result(reject_experiment(_load_experiment_payload(payload, config), config.artifacts_path / "rejections"), function_name)
+        report = _load_experiment_payload(payload, config)
+        result = reject_experiment(report, config.artifacts_path / "rejections")
+        db_experiment_id = find_experiment_db_id(config.db_path, report)
+        if db_experiment_id is not None:
+            from dataevol.storage import connect
+
+            with connect(config.db_path) as conn:
+                conn.execute("UPDATE experiments SET status = ? WHERE id = ?", ("rejected", db_experiment_id))
+            result["db_experiment_id"] = db_experiment_id
+        return _normalize_result(result, function_name)
 
     if module_name in {"local_models", "local_model"}:
         from dataevol.local_models import (
@@ -280,7 +452,17 @@ def _call_known_operation(
             return _normalize_result({"path": str(promote_local_adapter(evaluation, output)), "promoted": True}, function_name)
 
     if module_name == "reports":
-        from dataevol.reports import build_report_payload, export_markdown_report, list_benchmarks, list_datasets, list_experiments, list_runs
+        from dataevol.reports import (
+            build_report_payload,
+            export_markdown_report,
+            list_benchmarks,
+            list_datasets,
+            list_experiments,
+            list_idea_prds,
+            list_opportunities,
+            list_promotions,
+            list_runs,
+        )
 
         if function_name == "runs":
             return _normalize_result({"runs": list_runs(config.db_path)}, function_name)
@@ -290,6 +472,12 @@ def _call_known_operation(
             return _normalize_result({"benchmarks": list_benchmarks(config.db_path)}, function_name)
         if function_name == "experiments":
             return _normalize_result({"experiments": list_experiments(config.db_path)}, function_name)
+        if function_name == "opportunities":
+            return _normalize_result({"opportunities": list_opportunities(config.db_path)}, function_name)
+        if function_name == "idea_prds":
+            return _normalize_result({"idea_prds": list_idea_prds(config.db_path)}, function_name)
+        if function_name == "promotions":
+            return _normalize_result({"promotions": list_promotions(config.db_path)}, function_name)
         if function_name in {"inbox", "markdown"}:
             report = build_report_payload(config.db_path, config.artifacts_path)
             if function_name == "markdown":

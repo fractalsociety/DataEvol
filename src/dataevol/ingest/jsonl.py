@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from dataevol.dedupe.exact import canonical_hash, normalized_text
+from dataevol.dedupe.similarity import near_duplicate_score
 from dataevol.privacy.redaction import privacy_status_for_mode, redact_value
 from dataevol.schemas.traces import CanonicalTrace, TraceValidationError, validate_trace
 from dataevol.storage.sqlite import connect, init_db
@@ -146,6 +147,55 @@ def _set_cluster_canonical(conn, content_hash: str, trace_id: int) -> int:
     return cluster_id
 
 
+def _trace_mapping(trace: CanonicalTrace) -> dict[str, Any]:
+    return {
+        "trace_id": trace.task_id,
+        "task_id": trace.task_id,
+        "trace_type": trace.trace_type,
+        "prompt": trace.prompt,
+        "response": trace.response,
+        "provider": trace.provider,
+        "model": trace.model,
+    }
+
+
+def _find_near_duplicate(conn, trace: CanonicalTrace, *, threshold: float) -> tuple[int, int, float] | None:
+    current = _trace_mapping(trace)
+    rows = conn.execute(
+        """
+        SELECT id, duplicate_cluster_id, task_id, trace_type, prompt, response, provider, model
+        FROM traces
+        ORDER BY id DESC
+        LIMIT 500
+        """
+    ).fetchall()
+    best: tuple[int, int, float] | None = None
+    for row in rows:
+        existing = dict(row)
+        if current.get("task_id") and existing.get("task_id") and current["task_id"] != existing["task_id"]:
+            continue
+        score = near_duplicate_score(current, existing)
+        if score >= threshold and (best is None or score > best[2]):
+            cluster_id = int(existing.get("duplicate_cluster_id") or _ensure_cluster(conn, f"near_duplicate_{existing['id']}", int(existing["id"])))
+            best = (int(existing["id"]), cluster_id, score)
+    return best
+
+
+def _mark_near_duplicate(conn, run_id: int, cluster_id: int, raw_path: Path) -> None:
+    conn.execute(
+        """
+        UPDATE duplicate_clusters
+        SET duplicate_count = duplicate_count + 1, last_seen_at = ?
+        WHERE id = ?
+        """,
+        (_now(), cluster_id),
+    )
+    conn.execute(
+        "INSERT INTO duplicate_events (cluster_id, run_id, raw_path, seen_at) VALUES (?, ?, ?, ?)",
+        (cluster_id, run_id, str(raw_path), _now()),
+    )
+
+
 def ingest_jsonl(
     jsonl_path: str | Path,
     db_path: str | Path,
@@ -155,6 +205,7 @@ def ingest_jsonl(
     raw_root: str | Path = ".dataevol/raw",
     external_run_id: str | None = None,
     objective: str | None = None,
+    near_duplicate_threshold: float | None = 0.82,
 ) -> IngestReport:
     init_db(db_path)
     jsonl_path = Path(jsonl_path)
@@ -184,6 +235,14 @@ def ingest_jsonl(
                         report.duplicates += 1
                         report.duplicate_hashes.append(content_hash)
                         continue
+                    if near_duplicate_threshold is not None:
+                        near = _find_near_duplicate(conn, redacted_trace, threshold=float(near_duplicate_threshold))
+                        if near is not None:
+                            existing_id, cluster_id, score = near
+                            _mark_near_duplicate(conn, run_id, cluster_id, raw_path)
+                            report.duplicates += 1
+                            report.duplicate_hashes.append(f"near:{existing_id}:{score:.4f}")
+                            continue
                     trace_id = _insert_trace(conn, run_id, redacted_trace, raw_path, content_hash, None)
                     _set_cluster_canonical(conn, content_hash, trace_id)
                     report.accepted += 1

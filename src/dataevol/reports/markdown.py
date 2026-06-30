@@ -29,20 +29,29 @@ def list_experiments(db_path: str | Path) -> list[dict[str, Any]]:
     return _rows(db_path, "experiments")
 
 
+def list_opportunities(db_path: str | Path) -> list[dict[str, Any]]:
+    return _rows(db_path, "evolution_opportunities")
+
+
+def list_idea_prds(db_path: str | Path) -> list[dict[str, Any]]:
+    return _rows(db_path, "idea_prds")
+
+
+def list_promotions(db_path: str | Path) -> list[dict[str, Any]]:
+    return _rows(db_path, "promotions")
+
+
 def build_report_payload(db_path: str | Path, artifacts_path: str | Path) -> dict[str, Any]:
     artifacts = Path(artifacts_path)
-    opportunities = sorted(str(path) for path in artifacts.glob("**/learning_opportunities.json"))
-    idea_prds = sorted(str(path) for path in artifacts.glob("**/*.md") if "idea" in path.name.lower())
-    promotions = sorted(str(path) for path in artifacts.glob("**/promotion*.json"))
     rejections = sorted(str(path) for path in artifacts.glob("**/rejected_*.json"))
     return {
         "runs": list_runs(db_path),
         "datasets": list_datasets(db_path),
         "benchmarks": list_benchmarks(db_path),
         "experiments": list_experiments(db_path),
-        "opportunities": opportunities,
-        "idea_prds": idea_prds,
-        "promotions": promotions,
+        "opportunities": list_opportunities(db_path),
+        "idea_prds": list_idea_prds(db_path),
+        "promotions": list_promotions(db_path),
         "rejections": rejections,
         "cost_savings": _metric_files(artifacts, "cost"),
         "quality_improvements": _metric_files(artifacts, "quality"),

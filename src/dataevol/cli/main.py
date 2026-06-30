@@ -23,6 +23,8 @@ synthetic_app = typer.Typer(help="Synthetic data commands.")
 privacy_app = typer.Typer(help="Privacy commands.")
 report_app = typer.Typer(help="Report commands.")
 local_model_app = typer.Typer(help="Local model adapter commands.")
+prompt_app = typer.Typer(help="Prompt pack commands.")
+integration_app = typer.Typer(help="Integration client commands.")
 
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(benchmark_app, name="benchmark")
@@ -31,6 +33,8 @@ app.add_typer(synthetic_app, name="synthetic")
 app.add_typer(privacy_app, name="privacy")
 app.add_typer(report_app, name="report")
 app.add_typer(local_model_app, name="local-model")
+app.add_typer(prompt_app, name="prompt")
+app.add_typer(integration_app, name="integration")
 
 
 def _print_result(result: dict[str, Any]) -> None:
@@ -41,6 +45,15 @@ def _expert_list(expert: str | None) -> list[str] | None:
     if not expert:
         return None
     return [item.strip() for item in expert.split(",") if item.strip()]
+
+
+def _json_option(value: str | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    path = Path(value)
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(value)
 
 
 @app.command()
@@ -98,20 +111,41 @@ def compress(run_id: Annotated[str, typer.Option("--run-id")], config: Annotated
 @dataset_app.command("build")
 def dataset_build(
     type: Annotated[str, typer.Option("--type", help="router, critic, verifier, or compressor.")],
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Build from a specific run.")] = None,
+    from_runs: Annotated[str | None, typer.Option("--from-runs", help="Run selector such as last_100 or all.")] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
 ) -> None:
     """Build a dataset."""
-    _print_result(call_core("datasets", "build_dataset", {"type": type}, config=load_config(config)))
+    _print_result(call_core("datasets", "build_dataset", {"type": type, "run_id": run_id, "from_runs": from_runs}, config=load_config(config)))
+
+
+@dataset_app.command("router-performance")
+def dataset_router_performance(
+    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+    from_runs: Annotated[str | None, typer.Option("--from-runs")] = "last_100",
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    _print_result(call_core("datasets", "router_performance", {"run_id": run_id, "from_runs": from_runs}, config=load_config(config)))
+
+
+@dataset_app.command("candidate-router-policy")
+def dataset_candidate_router_policy(
+    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+    from_runs: Annotated[str | None, typer.Option("--from-runs")] = "last_100",
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    _print_result(call_core("datasets", "candidate_router_policy", {"run_id": run_id, "from_runs": from_runs}, config=load_config(config)))
 
 
 @benchmark_app.command("build")
 def benchmark_build(
-    from_runs: Annotated[str, typer.Option("--from-runs", help="Run selector such as last_100.")],
+    from_runs: Annotated[str | None, typer.Option("--from-runs", help="Run selector such as last_100 or all.")] = None,
     type: Annotated[str | None, typer.Option("--type", help="router, prompt, verifier, critic, or compressor.")] = None,
+    run_id: Annotated[str | None, typer.Option("--run-id", help="Build from a specific run.")] = None,
     config: Annotated[Path | None, typer.Option("--config")] = None,
 ) -> None:
     """Build a benchmark."""
-    _print_result(call_core("benchmarks", "build_benchmark", {"from_runs": from_runs, "type": type}, config=load_config(config)))
+    _print_result(call_core("benchmarks", "build_benchmark", {"from_runs": from_runs or "last_100", "run_id": run_id, "type": type}, config=load_config(config)))
 
 
 @evolve_app.command("reflect")
@@ -120,8 +154,13 @@ def reflect(run_id: Annotated[str, typer.Option("--run-id")], config: Annotated[
 
 
 @evolve_app.command("idea-prd")
-def idea_prd(opportunity: Annotated[str, typer.Option("--opportunity")], config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
-    _print_result(call_core("evolve", "idea_prd", {"opportunity": opportunity}, config=load_config(config)))
+def idea_prd(
+    opportunity: Annotated[str | None, typer.Option("--opportunity", help="Opportunity JSON object or JSON file path.")] = None,
+    opportunity_id: Annotated[int | None, typer.Option("--opportunity-id", help="Load opportunity from SQLite by id.")] = None,
+    component: Annotated[str, typer.Option("--component", help="router, prompt, verifier, local_model, benchmark, or generic.")] = "router",
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    _print_result(call_core("evolve", "idea_prd", {"opportunity": opportunity, "opportunity_id": opportunity_id, "component": component}, config=load_config(config)))
 
 
 @evolve_app.command("experiment")
@@ -183,6 +222,18 @@ def privacy_set(
     typer.echo(f"Privacy mode set to {mode}")
 
 
+@privacy_app.command("export-candidates")
+def privacy_export_candidates(
+    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+    from_runs: Annotated[str | None, typer.Option("--from-runs")] = "last_100",
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    public: Annotated[bool, typer.Option("--public", help="Enforce public benchmark export policy.")] = False,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    payload = {"run_id": run_id, "from_runs": from_runs, "output": str(output) if output else None, "public": public}
+    _print_result(call_core("privacy", "export_training_candidates", payload, config=load_config(config)))
+
+
 @report_app.command("runs")
 def report_runs(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
     _print_result(call_core("reports", "runs", {}, config=load_config(config)))
@@ -201,6 +252,21 @@ def report_benchmarks(config: Annotated[Path | None, typer.Option("--config")] =
 @report_app.command("experiments")
 def report_experiments(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
     _print_result(call_core("reports", "experiments", {}, config=load_config(config)))
+
+
+@report_app.command("opportunities")
+def report_opportunities(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
+    _print_result(call_core("reports", "opportunities", {}, config=load_config(config)))
+
+
+@report_app.command("idea-prds")
+def report_idea_prds(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
+    _print_result(call_core("reports", "idea_prds", {}, config=load_config(config)))
+
+
+@report_app.command("promotions")
+def report_promotions(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
+    _print_result(call_core("reports", "promotions", {}, config=load_config(config)))
 
 
 @report_app.command("inbox")
@@ -280,6 +346,70 @@ def local_model_promote(
     evaluated = call_core("local_models", "evaluate", {"metrics": evaluation}, config=load_config(config))
     payload = {"output": str(output) if output else None, "evaluation": evaluated}
     _print_result(call_core("local_models", "promote", payload, config=load_config(config)))
+
+
+@prompt_app.command("variants")
+def prompt_variants(
+    pack: Annotated[str | None, typer.Option("--pack", help="Prompt pack JSON object.")] = None,
+    pack_path: Annotated[Path | None, typer.Option("--pack-path", help="Prompt pack JSON file.")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    payload = {"pack": _json_option(pack), "pack_path": str(pack_path) if pack_path else None}
+    _print_result(call_core("prompts", "variants", payload, config=load_config(config)))
+
+
+@prompt_app.command("version")
+def prompt_version(
+    pack: Annotated[str | None, typer.Option("--pack", help="Prompt pack JSON object.")] = None,
+    pack_path: Annotated[Path | None, typer.Option("--pack-path", help="Prompt pack JSON file.")] = None,
+    version: Annotated[str, typer.Option("--version")] = "v1",
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    payload = {"pack": _json_option(pack), "pack_path": str(pack_path) if pack_path else None, "version": version, "output": str(output) if output else None}
+    _print_result(call_core("prompts", "version", payload, config=load_config(config)))
+
+
+@prompt_app.command("ab-test")
+def prompt_ab_test(
+    control_metrics: Annotated[str, typer.Option("--control-metrics", help="JSON metrics object or file.")],
+    variant_metrics: Annotated[str, typer.Option("--variant-metrics", help="JSON metrics object or file.")],
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    payload = {"control_metrics": _json_option(control_metrics), "variant_metrics": _json_option(variant_metrics)}
+    _print_result(call_core("prompts", "ab_test", payload, config=load_config(config)))
+
+
+@prompt_app.command("promote")
+def prompt_promote(
+    test_result: Annotated[str, typer.Option("--test-result", help="JSON test result object or file.")],
+    output: Annotated[Path | None, typer.Option("--output")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    payload = {"test_result": _json_option(test_result), "output": str(output) if output else None}
+    _print_result(call_core("prompts", "promote", payload, config=load_config(config)))
+
+
+@integration_app.command("router-dataset-pull")
+def integration_router_dataset_pull(
+    manifest: Annotated[Path | None, typer.Option("--manifest", help="Local manifest path.")] = None,
+    endpoint: Annotated[str | None, typer.Option("--endpoint", help="Remote router/DataEvol endpoint.")] = None,
+    token: Annotated[str | None, typer.Option("--token")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    payload = {"manifest": str(manifest) if manifest else None, "endpoint": endpoint, "token": token}
+    _print_result(call_core("integrations", "router_dataset_pull", payload, config=load_config(config)))
+
+
+@integration_app.command("post-coordinate-completion")
+def integration_post_coordinate_completion(
+    endpoint: Annotated[str, typer.Option("--endpoint")],
+    run: Annotated[str, typer.Option("--run", help="Run JSON object or file.")],
+    token: Annotated[str | None, typer.Option("--token")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    payload = {"endpoint": endpoint, "run": _json_option(run), "token": token}
+    _print_result(call_core("integrations", "post_coordinate_completion", payload, config=load_config(config)))
 
 
 @app.command()

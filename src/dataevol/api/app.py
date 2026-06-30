@@ -84,6 +84,14 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     def build_dataset(request: OperationRequest) -> dict[str, Any]:
         return call_core("datasets", "build_dataset", request.payload, config=cfg)
 
+    @app.post("/router_performance", dependencies=[protected])
+    def router_performance(request: OperationRequest) -> dict[str, Any]:
+        return call_core("datasets", "router_performance", request.payload, config=cfg)
+
+    @app.post("/candidate_router_policy", dependencies=[protected])
+    def candidate_router_policy(request: OperationRequest) -> dict[str, Any]:
+        return call_core("datasets", "candidate_router_policy", request.payload, config=cfg)
+
     @app.post("/build_benchmark", dependencies=[protected])
     def build_benchmark(request: OperationRequest) -> dict[str, Any]:
         return call_core("benchmarks", "build_benchmark", request.payload, config=cfg)
@@ -111,6 +119,34 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     @app.post("/reject", dependencies=[protected])
     def reject(request: OperationRequest) -> dict[str, Any]:
         return call_core("evolve", "reject", request.payload, config=cfg)
+
+    @app.post("/privacy/export_training_candidates", dependencies=[protected])
+    def export_training_candidates(request: OperationRequest) -> dict[str, Any]:
+        return call_core("privacy", "export_training_candidates", request.payload, config=cfg)
+
+    @app.post("/prompts/variants", dependencies=[protected])
+    def prompt_variants(request: OperationRequest) -> dict[str, Any]:
+        return call_core("prompts", "variants", request.payload, config=cfg)
+
+    @app.post("/prompts/version", dependencies=[protected])
+    def prompt_version(request: OperationRequest) -> dict[str, Any]:
+        return call_core("prompts", "version", request.payload, config=cfg)
+
+    @app.post("/prompts/ab_test", dependencies=[protected])
+    def prompt_ab_test(request: OperationRequest) -> dict[str, Any]:
+        return call_core("prompts", "ab_test", request.payload, config=cfg)
+
+    @app.post("/prompts/promote", dependencies=[protected])
+    def prompt_promote(request: OperationRequest) -> dict[str, Any]:
+        return call_core("prompts", "promote", request.payload, config=cfg)
+
+    @app.post("/integrations/router_dataset_pull", dependencies=[protected])
+    def router_dataset_pull(request: OperationRequest) -> dict[str, Any]:
+        return call_core("integrations", "router_dataset_pull", request.payload, config=cfg)
+
+    @app.post("/integrations/post_coordinate_completion", dependencies=[protected])
+    def post_coordinate_completion(request: OperationRequest) -> dict[str, Any]:
+        return call_core("integrations", "post_coordinate_completion", request.payload, config=cfg)
 
     @app.post("/local_model/prepare", dependencies=[protected])
     def local_model_prepare(request: OperationRequest) -> dict[str, Any]:
@@ -143,6 +179,18 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     @app.get("/experiments")
     def experiments() -> dict[str, Any]:
         return call_core("reports", "experiments", {}, config=cfg)
+
+    @app.get("/opportunities")
+    def opportunities() -> dict[str, Any]:
+        return call_core("reports", "opportunities", {}, config=cfg)
+
+    @app.get("/idea_prds")
+    def idea_prds() -> dict[str, Any]:
+        return call_core("reports", "idea_prds", {}, config=cfg)
+
+    @app.get("/promotions")
+    def promotions() -> dict[str, Any]:
+        return call_core("reports", "promotions", {}, config=cfg)
 
     return app
 

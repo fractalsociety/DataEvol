@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 from .redaction import can_export_publicly, redact_value
@@ -29,3 +31,30 @@ def assert_public_export_allowed(candidate: dict[str, Any]) -> None:
     if not can_export_publicly(str(candidate.get("privacy_status"))):
         raise PermissionError("private or anonymous traces cannot be exported as public benchmarks")
 
+
+def export_training_candidates(
+    traces: list[dict[str, Any]],
+    output_dir: str | Path,
+    *,
+    public: bool = False,
+) -> dict[str, Any]:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / ("public_training_candidates.jsonl" if public else "training_candidates.jsonl")
+    candidates: list[dict[str, Any]] = []
+    for trace in traces:
+        label = str(trace.get("label") or trace.get("outcome") or "inconclusive")
+        score = float(trace.get("training_value_score") or trace.get("quality_score") or trace.get("score") or 0.0)
+        candidate = build_training_candidate(trace, label, score)
+        if public:
+            assert_public_export_allowed(candidate)
+        candidates.append(candidate)
+    with path.open("w", encoding="utf-8") as handle:
+        for candidate in candidates:
+            handle.write(json.dumps(candidate, sort_keys=True) + "\n")
+    return {
+        "path": str(path),
+        "candidate_count": len(candidates),
+        "public": public,
+        "candidates": candidates,
+    }

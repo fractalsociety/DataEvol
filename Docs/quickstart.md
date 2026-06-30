@@ -56,14 +56,22 @@ dataevol ingest --jsonl examples/traces/mvp_traces.jsonl --source coordinate
 dataevol label --run-id 1
 dataevol score --run-id 1
 dataevol compress --run-id 1
-dataevol dataset build --type router
+dataevol dataset build --type router --run-id 1
+dataevol dataset router-performance --run-id 1
+dataevol dataset candidate-router-policy --run-id 1
 dataevol benchmark build --from-runs last_100 --type router
 dataevol synthetic generate
 dataevol evolve reflect --run-id 1
+dataevol evolve idea-prd --opportunity-id 1
 dataevol evolve experiment --run-id 1 --variant-provider openrouter
 dataevol evolve compare --experiment exp_router_policy_measured
 dataevol report inbox
+dataevol report opportunities
+dataevol report idea-prds
+dataevol report promotions
 dataevol report markdown
+dataevol privacy export-candidates --run-id 1
+dataevol prompt variants --pack '{"manager":"plan"}'
 ```
 
 ## Local Expert Adapters
