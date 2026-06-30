@@ -1,0 +1,10 @@
+[paths]
+db = ".dataevol/dataevol.sqlite3"
+raw = ".dataevol/raw"
+artifacts = ".dataevol/artifacts"
+
+[api]
+token = "dev-local-token"
+
+[privacy]
+mode = "private-local-only"

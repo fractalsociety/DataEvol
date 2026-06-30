@@ -1,0 +1,27 @@
+{
+  "run_id": "coordinate_run_001",
+  "source_system": "coordinate",
+  "traces": [
+    {
+      "id": "coord_trace_001",
+      "trace_type": "router_trace",
+      "task": "Assign worker to low-risk documentation task",
+      "task_type": "coding_agent_workflow",
+      "decision": {
+        "worker": "worker-docs",
+        "provider": "openrouter_free",
+        "model": "mock-small",
+        "reason": "Low risk and verifier-backed."
+      },
+      "label": "accepted",
+      "score": 0.94,
+      "metrics": {
+        "cost_usd": 0.0,
+        "latency_ms": 900,
+        "quality": 0.94
+      },
+      "privacy_status": "local_only",
+      "why_good": "Correctly used a cheap worker and passed verification."
+    }
+  ]
+}

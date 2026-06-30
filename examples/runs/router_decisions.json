@@ -1,0 +1,16 @@
+{
+  "decisions": [
+    {
+      "trace_type": "router_trace",
+      "task_id": "route_docs_001",
+      "prompt": "Route a low-risk documentation task.",
+      "provider": "openrouter",
+      "model": "free-model",
+      "outcome": "accepted",
+      "metrics": {
+        "cost_usd": 0.0,
+        "latency_ms": 900
+      }
+    }
+  ]
+}

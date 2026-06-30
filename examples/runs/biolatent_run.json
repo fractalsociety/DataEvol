@@ -1,0 +1,11 @@
+{
+  "verification_traces": [
+    {
+      "trace_type": "scientific_trace",
+      "task_id": "verify_protocol_001",
+      "prompt": "Verify that the protocol claim is supported by evidence.",
+      "response": "Verification passed with cited evidence.",
+      "outcome": "accepted"
+    }
+  ]
+}

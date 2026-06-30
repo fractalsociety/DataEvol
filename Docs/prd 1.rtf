@@ -1,0 +1,910 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2870
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica-Light;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 PRD: DataEvol \'97 Self-Evolving Data Collection, Labeling, Benchmark, and Experiment Pipeline\
+1. Product Name\
+DataEvol\
+Working subtitle:\
+A self-evolving data engine for agent traces, router decisions, scientific workflows, benchmarks, and training candidates.\
+2. Core Goal\
+DataEvol is a standalone repo/service that continuously improves the Fractal/BioLatent ecosystem by collecting traces, labeling outcomes, compressing useful failures, generating synthetic variants, building benchmarks, and running controlled micro-experiments before any improvement is promoted.\
+It should not be inside Coordinate, BioLatent, or the Router API.\
+Those systems should call DataEvol through an API.\
+coordinate/\
+  terminal spawning, worker execution, task graph\
+\
+fractal-router-api/\
+  worker/model routing and assignment\
+\
+biolatent/\
+  scientific workflows, protocols, verification\
+\
+dataevol/\
+  trace ingestion, labeling, scoring, synthetic data, benchmarks, experiments, promotion gates\
+3. One-Sentence Vision\
+DataEvol is the Datology-style data engine for Fractal: it turns raw agent traces, failures, corrections, verifier results, and user workflows into better datasets, better benchmarks, better prompts, better router policies, and better local models \'97 but only promotes changes after controlled experiments show measurable improvement.\
+4. Main Principle\
+DataEvol must never blindly self-modify production behavior.\
+Every proposed improvement must go through:\
+observe\
+  -> label\
+  -> score\
+  -> compress\
+  -> generate idea\
+  -> create Idea PRD\
+  -> run sandbox experiment\
+  -> compare against baseline\
+  -> verify no regression\
+  -> promote or reject\
+No benchmark improvement, no promotion.\
+No regression check, no promotion.\
+No rollback path, no promotion.\
+5. What DataEvol Improves\
+DataEvol can improve:\
+router decisions\
+worker assignment\
+model mix policy\
+prompt packs\
+task decomposition\
+trace compression\
+duplicate detection\
+verifier/critic prompts\
+benchmark suites\
+synthetic data generation\
+local router datasets\
+local evaluator datasets\
+local compressor datasets\
+negative-example handling\
+cost/latency efficiency\
+scientific workflow quality\
+coding-agent workflows\
+OpenRouter free/cheap model ranking\
+6. What DataEvol Does Not Do\
+DataEvol does not:\
+execute user tasks directly\
+spawn terminal workers\
+replace Coordinate\
+replace BioLatent\
+replace the Fractal Router API\
+make final scientific claims\
+auto-push changes to production\
+train on private user data without opt-in\
+store raw sensitive data when a compact/redacted trace is sufficient\
+7. System Architecture\
+Fractal/BioLatent/Coordinate run\
+        \uc0\u8595 \
+raw traces + task graph + model choices + verifier results\
+        \uc0\u8595 \
+DataEvol ingest\
+        \uc0\u8595 \
+clean / normalize / redact\
+        \uc0\u8595 \
+dedupe\
+        \uc0\u8595 \
+label\
+        \uc0\u8595 \
+score\
+        \uc0\u8595 \
+compress\
+        \uc0\u8595 \
+dataset builders\
+        \uc0\u8595 \
+benchmark builders\
+        \uc0\u8595 \
+Evolver Agent\
+        \uc0\u8595 \
+Idea PRD\
+        \uc0\u8595 \
+sandbox experiment\
+        \uc0\u8595 \
+baseline vs variant comparison\
+        \uc0\u8595 \
+promotion gate\
+        \uc0\u8595 \
+router/prompt/model/data improvement\
+8. Primary Command Surface\
+Initialize repo/service\
+dataevol init\
+Ingest traces\
+dataevol ingest --source coordinate --path ./run_artifacts/\
+dataevol ingest --source biolatent --path ./biolatent_run/\
+dataevol ingest --jsonl ./traces.jsonl\
+Label traces\
+dataevol label --run-id run_001\
+Score traces\
+dataevol score --run-id run_001\
+Compress traces\
+dataevol compress --run-id run_001\
+Build datasets\
+dataevol dataset build --type router\
+dataevol dataset build --type critic\
+dataevol dataset build --type verifier\
+dataevol dataset build --type compressor\
+Build benchmarks\
+dataevol benchmark build --from-runs last_100\
+Reflection / improvement discovery\
+dataevol evolve reflect --run-id run_001\
+Generate Idea PRD\
+dataevol evolve idea-prd --opportunity opp_001\
+Run sandbox experiment\
+dataevol evolve experiment --idea ./ideas/opp_001/IDEA_PRD.md\
+Compare baseline vs variant\
+dataevol evolve compare --experiment exp_001\
+Promote only if validated\
+dataevol evolve promote --experiment exp_001\
+Reject/archive failed experiment\
+dataevol evolve reject --experiment exp_001\
+9. API Surface\
+DataEvol should expose a local API so Coordinate, BioLatent, and the Router API can call it.\
+POST /ingest_trace\
+POST /ingest_run\
+POST /label\
+POST /score\
+POST /compress\
+POST /dedupe\
+POST /build_dataset\
+POST /build_benchmark\
+POST /reflect\
+POST /idea_prd\
+POST /experiment\
+POST /compare\
+POST /promote\
+POST /reject\
+GET  /runs\
+GET  /datasets\
+GET  /benchmarks\
+GET  /experiments\
+GET  /health\
+10. Core Data Pipeline\
+raw trace\
+  \uc0\u8595 \
+schema validation\
+  \uc0\u8595 \
+privacy/redaction\
+  \uc0\u8595 \
+normalization\
+  \uc0\u8595 \
+dedupe\
+  \uc0\u8595 \
+labeling\
+  \uc0\u8595 \
+scoring\
+  \uc0\u8595 \
+compression\
+  \uc0\u8595 \
+dataset assignment\
+  \uc0\u8595 \
+benchmark assignment\
+  \uc0\u8595 \
+training candidate export\
+11. Trace Types\
+DataEvol should support these trace types:\
+planner_trace\
+router_trace\
+worker_trace\
+coding_trace\
+scientific_trace\
+verification_trace\
+critic_trace\
+tool_trace\
+failure_trace\
+correction_trace\
+promotion_trace\
+benchmark_trace\
+12. Trace Outcome Labels\
+Every trace should be labeled with outcome:\
+accepted\
+rejected\
+failed_tests\
+failed_verification\
+hallucinated\
+duplicated\
+too_expensive\
+too_slow\
+rescued_by_stronger_model\
+useful_negative_example\
+good_training_candidate\
+unsafe_or_policy_blocked\
+inconclusive\
+13. Failure Taxonomy\
+Wrong answers are valuable, but they must be stored as negative/evaluator data, not as good-answer data.\
+Failure types:\
+wrong_reasoning\
+wrong_tool\
+bad_router_assignment\
+hallucinated_citation\
+fabricated_data\
+failed_code_tests\
+bad_scientific_claim\
+weak_evidence\
+missed_dependency\
+duplicated_work\
+overused_frontier_model\
+underused_local_model\
+context_loss\
+format_failure\
+unsafe_output\
+14. Retention Policy\
+Not all data should be kept at full size.\
+Accepted high-value trace:\
+  keep full trace + compressed version\
+\
+Wrong but informative trace:\
+  keep compressed trace + failure label + corrected trace link\
+\
+Low-value repeated junk:\
+  keep metadata only or discard after summary\
+\
+Sensitive/private trace:\
+  redact or keep local-only according to user setting\
+15. Privacy Modes\
+DataEvol must support three modes:\
+private-local-only\
+shared-anonymous-learning\
+public-benchmark-contribution\
+Default:\
+private-local-only\
+Rules:\
+Raw user data stays local unless user opts in.\
+Sensitive data is redacted before dataset export.\
+Training candidates must carry privacy status.\
+Public benchmarks cannot include private user content.\
+User can delete run data.\
+User can disable synthetic generation on private traces.\
+Command:\
+dataevol privacy set private-local-only\
+16. Main Database Tables\
+Use SQLite for MVP.\
+CREATE TABLE IF NOT EXISTS runs (\
+  id INTEGER PRIMARY KEY,\
+  external_run_id TEXT,\
+  source_system TEXT NOT NULL,\
+  objective TEXT,\
+  status TEXT NOT NULL,\
+  privacy_mode TEXT NOT NULL,\
+  created_at TEXT NOT NULL,\
+  completed_at TEXT\
+);\
+\
+CREATE TABLE IF NOT EXISTS traces (\
+  id INTEGER PRIMARY KEY,\
+  run_id INTEGER NOT NULL,\
+  trace_type TEXT NOT NULL,\
+  task_id TEXT,\
+  agent_id TEXT,\
+  provider TEXT,\
+  model TEXT,\
+  prompt TEXT,\
+  response TEXT,\
+  tool_calls TEXT,\
+  files_changed TEXT,\
+  tests_run TEXT,\
+  raw_path TEXT,\
+  privacy_status TEXT NOT NULL,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS labels (\
+  id INTEGER PRIMARY KEY,\
+  trace_id INTEGER NOT NULL,\
+  label TEXT NOT NULL,\
+  confidence REAL,\
+  source TEXT NOT NULL,\
+  notes TEXT,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS scores (\
+  id INTEGER PRIMARY KEY,\
+  trace_id INTEGER NOT NULL,\
+  quality_score REAL,\
+  correctness_score REAL,\
+  cost_score REAL,\
+  latency_score REAL,\
+  novelty_score REAL,\
+  safety_score REAL,\
+  training_value_score REAL,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS compressed_traces (\
+  id INTEGER PRIMARY KEY,\
+  trace_id INTEGER NOT NULL,\
+  summary TEXT NOT NULL,\
+  failure_type TEXT,\
+  why_useful TEXT,\
+  corrected_trace_id INTEGER,\
+  token_reduction_ratio REAL,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS datasets (\
+  id INTEGER PRIMARY KEY,\
+  name TEXT NOT NULL,\
+  dataset_type TEXT NOT NULL,\
+  version TEXT NOT NULL,\
+  path TEXT NOT NULL,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS dataset_items (\
+  id INTEGER PRIMARY KEY,\
+  dataset_id INTEGER NOT NULL,\
+  trace_id INTEGER,\
+  item_type TEXT NOT NULL,\
+  accepted INTEGER DEFAULT 0,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS benchmarks (\
+  id INTEGER PRIMARY KEY,\
+  name TEXT NOT NULL,\
+  benchmark_type TEXT NOT NULL,\
+  version TEXT NOT NULL,\
+  frozen INTEGER DEFAULT 0,\
+  path TEXT NOT NULL,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS evolution_opportunities (\
+  id INTEGER PRIMARY KEY,\
+  run_id INTEGER,\
+  category TEXT NOT NULL,\
+  observation TEXT NOT NULL,\
+  hypothesis TEXT NOT NULL,\
+  proposed_change TEXT NOT NULL,\
+  expected_metric TEXT NOT NULL,\
+  risk_level TEXT NOT NULL,\
+  status TEXT NOT NULL,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS idea_prds (\
+  id INTEGER PRIMARY KEY,\
+  opportunity_id INTEGER NOT NULL,\
+  path TEXT NOT NULL,\
+  status TEXT NOT NULL,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS experiments (\
+  id INTEGER PRIMARY KEY,\
+  idea_prd_id INTEGER NOT NULL,\
+  control_version TEXT NOT NULL,\
+  variant_version TEXT NOT NULL,\
+  benchmark_id INTEGER NOT NULL,\
+  status TEXT NOT NULL,\
+  started_at TEXT,\
+  completed_at TEXT\
+);\
+\
+CREATE TABLE IF NOT EXISTS experiment_results (\
+  id INTEGER PRIMARY KEY,\
+  experiment_id INTEGER NOT NULL,\
+  metric TEXT NOT NULL,\
+  control_value REAL,\
+  variant_value REAL,\
+  delta REAL,\
+  verdict TEXT NOT NULL,\
+  created_at TEXT NOT NULL\
+);\
+\
+CREATE TABLE IF NOT EXISTS promotions (\
+  id INTEGER PRIMARY KEY,\
+  experiment_id INTEGER NOT NULL,\
+  promoted_component TEXT NOT NULL,\
+  old_version TEXT NOT NULL,\
+  new_version TEXT NOT NULL,\
+  rollback_path TEXT NOT NULL,\
+  promoted_at TEXT NOT NULL\
+);\
+17. Dataset Types\
+DataEvol should output:\
+router_dataset.jsonl\
+critic_dataset.jsonl\
+verifier_dataset.jsonl\
+planner_dataset.jsonl\
+worker_prompt_dataset.jsonl\
+trace_compression_dataset.jsonl\
+duplicate_detection_dataset.jsonl\
+failure_classification_dataset.jsonl\
+scientific_method_dataset.jsonl\
+coding_agent_dataset.jsonl\
+benchmark_tasks.jsonl\
+18. Training Candidate Format\
+\{\
+  "id": "candidate_001",\
+  "source_run_id": "run_001",\
+  "task": "Assign worker to low-risk literature review task",\
+  "input": "...",\
+  "output": "...",\
+  "label": "accepted",\
+  "score": 0.94,\
+  "use_for": ["router", "planner"],\
+  "provider": "openrouter_free",\
+  "model": "example-model",\
+  "cost_usd": 0.0,\
+  "latency_ms": 1200,\
+  "privacy_status": "local_only",\
+  "why_good": "Correctly assigned low-risk task to cheap/free model and passed verification.",\
+  "failure_notes": null\
+\}\
+19. Idea PRD Format\
+Every proposed improvement must become an Idea PRD before experiments run.\
+# Idea PRD: <title>\
+\
+## Observation\
+What happened?\
+\
+## Hypothesis\
+What change might improve the system?\
+\
+## Affected Component\
+router | prompt | dataset | benchmark | verifier | critic | compressor | local_model | model_mix\
+\
+## Baseline\
+Current behavior.\
+\
+## Variant\
+Proposed new behavior.\
+\
+## Benchmark\
+Frozen benchmark to test against.\
+\
+## Primary Metric\
+The metric that must improve.\
+\
+## Non-Regression Metrics\
+Metrics that must not get worse.\
+\
+## Safety Checks\
+What must remain safe?\
+\
+## Reproducibility Requirement\
+How many repeated runs must pass?\
+\
+## Rollback Plan\
+How to undo this change.\
+\
+## Promotion Rule\
+Exact condition for promotion.\
+\
+## Rejection Rule\
+Exact condition for rejection.\
+20. Promotion Gate\
+A candidate change can only be promoted if:\
+primary metric improves\
+AND no critical regression occurs\
+AND safety score does not decline\
+AND verification pass rate does not decline\
+AND result reproduces across at least 2 runs\
+AND rollback snapshot exists\
+Example promotion rules:\
+Router policy improvement:\
+  cost_per_verified_task decreases by >= 20%\
+  correctness decreases by <= 0%\
+  safety regressions = 0\
+\
+Prompt improvement:\
+  task success improves by >= 5%\
+  hallucination rate does not increase\
+  average cost does not increase by more than 10%\
+\
+Compressor improvement:\
+  token count decreases by >= 40%\
+  key-fact retention >= 95%\
+  failure labels preserved\
+21. MVP Scope\
+The MVP should prove one full loop:\
+Coordinate run traces\
+  -> DataEvol ingest\
+  -> label traces\
+  -> score traces\
+  -> compress wrong traces\
+  -> build router dataset\
+  -> generate one router-policy Idea PRD\
+  -> run control-vs-variant benchmark\
+  -> promote or reject with report\
+MVP does not need:\
+distributed training\
+large fine-tunes\
+cloud dashboard\
+full synthetic pretraining corpus\
+automatic production deployment\
+multi-tenant SaaS\
+22. Repo Structure\
+dataevol/\
+  README.md\
+  Cargo.toml or pyproject.toml\
+  src/\
+    cli/\
+    api/\
+    ingest/\
+    schemas/\
+    storage/\
+    clean/\
+    dedupe/\
+    label/\
+    score/\
+    compress/\
+    datasets/\
+    benchmarks/\
+    synthetic/\
+    evolve/\
+    experiments/\
+    promotion/\
+    privacy/\
+    integrations/\
+      coordinate/\
+      biolatent/\
+      fractal_router/\
+  migrations/\
+  examples/\
+    traces/\
+    runs/\
+    idea_prds/\
+    benchmarks/\
+  tests/\
+  docs/\
+Rust is preferred if you want consistency with Coordinate.\
+Python is acceptable for faster ML/data iteration.\
+A good hybrid:\
+Rust:\
+  CLI, API, SQLite, file IO, orchestration\
+\
+Python:\
+  embedding models, synthetic generation, local model labeling, dataset transforms\
+23. Build Checklist\
+Status legend:\
+- [ ] not done\
+- [x] done\
+[SERIAL] must happen in order\
+[PARALLEL] can run alongside other work after dependencies are met\
+Phase 0 \'97 Repo Bootstrap\
+- [x] D001 [SERIAL] Create new dataevol repository.\
+- [x] D002 [SERIAL] Add README with project purpose and repo boundaries.\
+- [x] D003 [SERIAL] Decide MVP stack: Rust-only, Python-only, or Rust + Python hybrid.\
+- [x] D004 [SERIAL] Add CLI skeleton: dataevol --help.\
+- [x] D005 [SERIAL] Add config file support: dataevol.toml.\
+- [x] D006 [SERIAL] Add SQLite database initialization.\
+- [x] D007 [SERIAL] Add migrations folder.\
+- [x] D008 [PARALLEL] Add example trace files.\
+- [x] D009 [PARALLEL] Add docs folder.\
+- [x] D010 [SERIAL] Add basic test runner and CI command.\
+Phase 1 \'97 Trace Ingestion\
+- [x] D011 [SERIAL] Define canonical trace schema.\
+- [x] D012 [SERIAL] Add dataevol ingest --jsonl.\
+- [x] D013 [SERIAL] Validate trace schema on ingest.\
+- [x] D014 [SERIAL] Store raw trace metadata in SQLite.\
+- [x] D015 [SERIAL] Store raw trace payloads as append-only files.\
+- [x] D016 [PARALLEL] Add Coordinate run importer.\
+- [x] D017 [PARALLEL] Add BioLatent run importer.\
+- [x] D018 [PARALLEL] Add Fractal Router decision importer.\
+- [x] D019 [PARALLEL] Add OpenRouter provider metadata parser.\
+- [x] D020 [SERIAL] Add ingest report: accepted, rejected, malformed, duplicate candidates.\
+Phase 2 \'97 Privacy, Redaction, and Normalization\
+- [x] D021 [SERIAL] Add privacy modes: private-local-only, shared-anonymous-learning, public-benchmark-contribution.\
+- [x] D022 [SERIAL] Add redaction pass for emails, keys, secrets, tokens, personal identifiers.\
+- [x] D023 [SERIAL] Add normalized trace text field.\
+- [x] D024 [SERIAL] Add hash for exact duplicate detection.\
+- [x] D025 [PARALLEL] Add provider/model name normalization.\
+- [x] D026 [PARALLEL] Add task type normalization.\
+- [x] D027 [PARALLEL] Add outcome label normalization.\
+- [x] D028 [SERIAL] Add test that private traces cannot be exported publicly.\
+Phase 3 \'97 Deduplication\
+- [x] D029 [SERIAL] Implement exact duplicate detection.\
+- [x] D030 [SERIAL] Implement near-duplicate detection.\
+- [x] D031 [SERIAL] Add duplicate cluster table.\
+- [x] D032 [PARALLEL] Add prompt similarity scoring.\
+- [x] D033 [PARALLEL] Add response similarity scoring.\
+- [x] D034 [PARALLEL] Add task similarity scoring.\
+- [x] D035 [SERIAL] Add duplicate report.\
+- [x] D036 [SERIAL] Test that repeated low-value traces are compacted or discarded.\
+Phase 4 \'97 Labeling System\
+- [x] D037 [SERIAL] Define label taxonomy.\
+- [x] D038 [SERIAL] Add rule-based labeler.\
+- [x] D039 [SERIAL] Add dataevol label --run-id.\
+- [x] D040 [PARALLEL] Add failure-type labels.\
+- [x] D041 [PARALLEL] Add success/outcome labels.\
+- [x] D042 [PARALLEL] Add cost/latency labels.\
+- [x] D043 [PARALLEL] Add safety labels.\
+- [x] D044 [PARALLEL] Add training-value labels.\
+- [x] D045 [SERIAL] Add local-model labeler interface.\
+- [x] D046 [SERIAL] Add human-review override option.\
+- [x] D047 [SERIAL] Test labeling consistency on fixture traces.\
+Phase 5 \'97 Scoring System\
+- [x] D048 [SERIAL] Define scoring dimensions.\
+- [x] D049 [SERIAL] Add dataevol score --run-id.\
+- [x] D050 [SERIAL] Compute correctness score from tests/verifier result.\
+- [x] D051 [SERIAL] Compute quality score.\
+- [x] D052 [SERIAL] Compute cost score.\
+- [x] D053 [SERIAL] Compute latency score.\
+- [x] D054 [SERIAL] Compute safety score.\
+- [x] D055 [SERIAL] Compute training-value score.\
+- [x] D056 [PARALLEL] Add novelty score.\
+- [x] D057 [PARALLEL] Add duplicate penalty.\
+- [x] D058 [PARALLEL] Add escalation/rescue score.\
+- [x] D059 [SERIAL] Add score report.\
+Phase 6 \'97 Trace Compression\
+- [x] D060 [SERIAL] Add dataevol compress --run-id.\
+- [x] D061 [SERIAL] Define compressed trace schema.\
+- [x] D062 [SERIAL] Compress accepted traces into high-signal summaries.\
+- [x] D063 [SERIAL] Compress wrong traces into failure summaries.\
+- [x] D064 [SERIAL] Preserve links between bad trace and corrected trace.\
+- [x] D065 [PARALLEL] Add local compression model interface.\
+- [x] D066 [PARALLEL] Add key-fact retention check.\
+- [x] D067 [PARALLEL] Add token reduction metric.\
+- [x] D068 [SERIAL] Test compressed traces retain task, outcome, failure type, and correction link.\
+Phase 7 \'97 Dataset Builders\
+- [x] D069 [SERIAL] Add dataevol dataset build.\
+- [x] D070 [SERIAL] Build router dataset.\
+- [x] D071 [SERIAL] Build critic dataset.\
+- [x] D072 [SERIAL] Build verifier dataset.\
+- [x] D073 [PARALLEL] Build planner dataset.\
+- [x] D074 [PARALLEL] Build prompt-improvement dataset.\
+- [x] D075 [PARALLEL] Build trace-compression dataset.\
+- [x] D076 [PARALLEL] Build duplicate-detection dataset.\
+- [x] D077 [PARALLEL] Build failure-classification dataset.\
+- [x] D078 [SERIAL] Add dataset versioning.\
+- [x] D079 [SERIAL] Add dataset manifest with source runs, privacy status, and license/provenance.\
+Phase 8 \'97 Benchmark Builders\
+- [x] D080 [SERIAL] Add dataevol benchmark build.\
+- [x] D081 [SERIAL] Define benchmark task schema.\
+- [x] D082 [SERIAL] Build frozen benchmark sets from prior runs.\
+- [x] D083 [SERIAL] Add benchmark versioning.\
+- [x] D084 [PARALLEL] Build router benchmarks.\
+- [x] D085 [PARALLEL] Build prompt benchmarks.\
+- [x] D086 [PARALLEL] Build verifier benchmarks.\
+- [x] D087 [PARALLEL] Build critic benchmarks.\
+- [x] D088 [PARALLEL] Build compressor benchmarks.\
+- [x] D089 [SERIAL] Test that frozen benchmarks cannot silently change.\
+Phase 9 \'97 Synthetic Data Engine\
+- [x] D090 [SERIAL] Add dataevol synthetic generate.\
+- [x] D091 [SERIAL] Generate corrected versions of failed traces.\
+- [x] D092 [SERIAL] Generate alternate task decompositions.\
+- [x] D093 [SERIAL] Generate better router decisions from bad router decisions.\
+- [x] D094 [PARALLEL] Generate hard negative examples.\
+- [x] D095 [PARALLEL] Generate adversarial verifier examples.\
+- [x] D096 [PARALLEL] Generate prompt variants.\
+- [x] D097 [PARALLEL] Generate synthetic benchmark tasks.\
+- [x] D098 [SERIAL] Add synthetic-data filtering and scoring.\
+- [x] D099 [SERIAL] Prevent synthetic data from being marked as real measured data.\
+- [x] D100 [SERIAL] Test synthetic items carry provenance and generation method.\
+Phase 10 \'97 Evolver Agent\
+- [x] D101 [SERIAL] Add dataevol evolve reflect --run-id.\
+- [x] D102 [SERIAL] Load traces, labels, scores, benchmark results, and verifier reports.\
+- [x] D103 [SERIAL] Detect learning opportunities.\
+- [x] D104 [PARALLEL] Detect router mistakes.\
+- [x] D105 [PARALLEL] Detect repeated worker failures.\
+- [x] D106 [PARALLEL] Detect unnecessary frontier-model usage.\
+- [x] D107 [PARALLEL] Detect duplicate worker effort.\
+- [x] D108 [PARALLEL] Detect missing benchmark opportunities.\
+- [x] D109 [PARALLEL] Detect prompt confusion.\
+- [x] D110 [SERIAL] Save learning_opportunities.json.\
+- [x] D111 [SERIAL] Test that weak/noisy opportunities are rejected as NO_IDEA.\
+Phase 11 \'97 Idea PRD Generator\
+- [x] D112 [SERIAL] Add dataevol evolve idea-prd.\
+- [x] D113 [SERIAL] Define Idea PRD schema.\
+- [x] D114 [SERIAL] Require hypothesis, baseline, variant, metric, benchmark, safety check, rollback plan.\
+- [x] D115 [PARALLEL] Generate router-policy Idea PRDs.\
+- [x] D116 [PARALLEL] Generate prompt-pack Idea PRDs.\
+- [x] D117 [PARALLEL] Generate verifier-policy Idea PRDs.\
+- [x] D118 [PARALLEL] Generate local-model dataset Idea PRDs.\
+- [x] D119 [PARALLEL] Generate benchmark-improvement Idea PRDs.\
+- [x] D120 [SERIAL] Save Idea PRDs to .dataevol/evolution/ideas/.\
+- [x] D121 [SERIAL] Test Idea PRD completeness validation.\
+Phase 12 \'97 Experiment Harness\
+- [x] D122 [SERIAL] Add dataevol evolve experiment.\
+- [x] D123 [SERIAL] Create sandbox experiment directory.\
+- [x] D124 [SERIAL] Create control-vs-variant runner.\
+- [x] D125 [SERIAL] Freeze benchmark before experiment starts.\
+- [x] D126 [SERIAL] Run control version.\
+- [x] D127 [SERIAL] Run variant version.\
+- [x] D128 [PARALLEL] Collect correctness metrics.\
+- [x] D129 [PARALLEL] Collect cost metrics.\
+- [x] D130 [PARALLEL] Collect latency metrics.\
+- [x] D131 [PARALLEL] Collect safety metrics.\
+- [x] D132 [PARALLEL] Collect regression metrics.\
+- [x] D133 [SERIAL] Save experiment_report.json.\
+- [x] D134 [SERIAL] Test experiment reproducibility on fixture benchmark.\
+Phase 13 \'97 Compare, Promote, Reject\
+- [x] D135 [SERIAL] Add dataevol evolve compare.\
+- [x] D136 [SERIAL] Define primary success metric per experiment.\
+- [x] D137 [SERIAL] Define non-regression metrics.\
+- [x] D138 [SERIAL] Require at least 2 reproducible runs for promotion.\
+- [x] D139 [SERIAL] Add dataevol evolve promote.\
+- [x] D140 [SERIAL] Create rollback snapshot before promotion.\
+- [x] D141 [SERIAL] Version promoted components.\
+- [x] D142 [SERIAL] Add dataevol evolve reject.\
+- [x] D143 [SERIAL] Store failed experiments as negative evidence.\
+- [x] D144 [SERIAL] Test that failed experiments cannot promote.\
+Phase 14 \'97 Router Improvement Loop\
+- [x] D145 [SERIAL] Build router-performance dataset.\
+- [x] D146 [SERIAL] Store task \uc0\u8594  selected model \u8594  result \u8594  score.\
+- [x] D147 [SERIAL] Generate candidate router policy.\
+- [x] D148 [SERIAL] Test candidate router policy on frozen benchmark.\
+- [x] D149 [PARALLEL] Track provider success rate.\
+- [x] D150 [PARALLEL] Track cost-normalized quality score.\
+- [x] D151 [PARALLEL] Track escalation/rescue rate.\
+- [x] D152 [SERIAL] Promote router policy only if quality/cost improves without safety regression.\
+Phase 15 \'97 Prompt Improvement Loop\
+- [x] D153 [SERIAL] Version all prompt packs.\
+- [x] D154 [SERIAL] Store prompt version used for every trace.\
+- [x] D155 [SERIAL] Generate candidate prompt pack.\
+- [x] D156 [PARALLEL] Generate manager prompt variants.\
+- [x] D157 [PARALLEL] Generate worker prompt variants.\
+- [x] D158 [PARALLEL] Generate critic prompt variants.\
+- [x] D159 [PARALLEL] Generate verifier prompt variants.\
+- [x] D160 [SERIAL] A/B test prompt packs on frozen benchmark.\
+- [x] D161 [SERIAL] Promote only if success improves and hallucination/regression does not worsen.\
+Phase 16 \'97 Local Model Dataset Loop\
+- [x] D162 [SERIAL] Add opt-in policy for local training data.\
+- [x] D163 [SERIAL] Export local-router dataset.\
+- [x] D164 [SERIAL] Export local-compressor dataset.\
+- [x] D165 [SERIAL] Export local-duplicate-detector dataset.\
+- [x] D166 [SERIAL] Export local-evaluator dataset.\
+- [x] D167 [PARALLEL] Add reproducible LoRA/adapter training manifest and runner.\
+- [x] D168 [PARALLEL] Add evaluation harness for local adapter.\
+- [x] D169 [SERIAL] Promote local adapter only after benchmark improvement.\
+Phase 17 \'97 API Service\
+- [x] D170 [SERIAL] Add local HTTP API.\
+- [x] D171 [SERIAL] Add /health.\
+- [x] D172 [SERIAL] Add /ingest_trace.\
+- [x] D173 [SERIAL] Add /ingest_run.\
+- [x] D174 [SERIAL] Add /label.\
+- [x] D175 [SERIAL] Add /score.\
+- [x] D176 [SERIAL] Add /compress.\
+- [x] D177 [SERIAL] Add /build_dataset.\
+- [x] D178 [SERIAL] Add /build_benchmark.\
+- [x] D179 [SERIAL] Add /reflect.\
+- [x] D180 [SERIAL] Add /experiment.\
+- [x] D181 [SERIAL] Add API auth token for local service.\
+- [x] D182 [SERIAL] Add tests for API endpoints.\
+Phase 18 \'97 Integrations\
+- [x] D183 [SERIAL] Add Coordinate integration guide.\
+- [x] D184 [SERIAL] Coordinate calls DataEvol after run completion.\
+- [x] D185 [SERIAL] Add Fractal Router API integration guide.\
+- [x] D186 [SERIAL] Router pulls DataEvol router dataset/benchmark results.\
+- [x] D187 [SERIAL] Add BioLatent integration guide.\
+- [x] D188 [SERIAL] BioLatent sends verification and scientific traces to DataEvol.\
+- [x] D189 [PARALLEL] Add OpenRouter cost/model metadata integration.\
+- [x] D190 [PARALLEL] Add local model metadata integration.\
+- [x] D191 [SERIAL] End-to-end integration test with mocked Coordinate run.\
+Phase 19 \'97 Dashboard / Reports\
+- [x] D192 [SERIAL] Add dataevol report run --run-id.\
+- [x] D193 [SERIAL] Add dataevol report dataset.\
+- [x] D194 [SERIAL] Add dataevol report benchmark.\
+- [x] D195 [SERIAL] Add dataevol evolve inbox.\
+- [x] D196 [SERIAL] Show opportunities, Idea PRDs, experiments, promotions, and rejections.\
+- [x] D197 [PARALLEL] Show cost savings.\
+- [x] D198 [PARALLEL] Show quality improvements.\
+- [x] D199 [PARALLEL] Show safety/regression status.\
+- [x] D200 [SERIAL] Add markdown report export.\
+Phase 20 \'97 Hardening and Release\
+- [x] D201 [SERIAL] Add full test suite.\
+- [x] D202 [SERIAL] Add fixture dataset.\
+- [x] D203 [SERIAL] Add migration tests.\
+- [x] D204 [SERIAL] Add privacy/redaction tests.\
+- [x] D205 [SERIAL] Add benchmark immutability tests.\
+- [x] D206 [SERIAL] Add promotion-gate tests.\
+- [x] D207 [SERIAL] Add README quickstart.\
+- [x] D208 [SERIAL] Add docs for API usage.\
+- [x] D209 [SERIAL] Add examples for Coordinate, Router API, and BioLatent.\
+- [x] D210 [SERIAL] Tag MVP release v0.1.0.\
+24. Critical Serial Path\
+The fastest MVP path:\
+D001 -> D002 -> D003 -> D004 -> D006 -> D010\
+-> D011 -> D012 -> D013 -> D014 -> D015 -> D020\
+-> D021 -> D022 -> D023 -> D024 -> D028\
+-> D029 -> D030 -> D031 -> D035 -> D036\
+-> D037 -> D038 -> D039 -> D045 -> D047\
+-> D048 -> D049 -> D050 -> D055 -> D059\
+-> D060 -> D061 -> D062 -> D063 -> D064 -> D068\
+-> D069 -> D070 -> D078 -> D079\
+-> D080 -> D081 -> D082 -> D083 -> D089\
+-> D101 -> D102 -> D103 -> D110 -> D111\
+-> D112 -> D113 -> D114 -> D120 -> D121\
+-> D122 -> D123 -> D124 -> D125 -> D126 -> D127 -> D133 -> D134\
+-> D135 -> D136 -> D137 -> D138 -> D139/D142\
+-> D170 -> D171 -> D172 -> D182\
+-> D207 -> D210\
+25. Parallel Work Pool\
+These can run once their phase dependency is satisfied:\
+D008-D009\
+D016-D019\
+D025-D027\
+D032-D034\
+D040-D044\
+D056-D058\
+D065-D067\
+D073-D077\
+D084-D088\
+D094-D097\
+D104-D109\
+D115-D119\
+D128-D132\
+D149-D151\
+D156-D159\
+D167-D168\
+D189-D190\
+D197-D199\
+26. MVP Definition of Done\
+MVP is complete when:\
+- [x] DataEvol is a separate repo.\
+- [x] Coordinate or a mocked Coordinate run can send traces to DataEvol.\
+- [x] DataEvol ingests traces into SQLite.\
+- [x] Traces are validated, normalized, redacted, and deduped.\
+- [x] Traces are labeled by outcome and failure type.\
+- [x] Traces are scored for quality, correctness, cost, latency, safety, and training value.\
+- [x] Wrong traces are compressed into useful negative examples.\
+- [x] DataEvol exports at least one router dataset.\
+- [x] DataEvol builds at least one frozen benchmark.\
+- [x] Evolver Agent detects at least one learning opportunity.\
+- [x] DataEvol generates one Idea PRD.\
+- [x] DataEvol runs a control-vs-variant sandbox experiment.\
+- [x] DataEvol promotes only if metrics improve and no regression is found.\
+- [x] Failed ideas are rejected and archived as negative evidence.\
+- [x] Privacy mode defaults to private-local-only.\
+27. First Real MVP Experiment\
+The first experiment should be simple:\
+Hypothesis\
+Low-risk literature/documentation tasks can be routed to OpenRouter free models instead of Claude/Codex without reducing verification pass rate.\
+Baseline\
+Current router policy.\
+Variant\
+Updated router policy sends low-risk literature/documentation tasks to OpenRouter free models first.\
+Benchmark\
+50 prior low-risk documentation/literature tasks.\
+Primary Metric\
+Cost per verified task.\
+Non-Regression Metrics\
+verification pass rate\
+human correction rate\
+hallucination rate\
+task completion rate\
+Promotion Rule\
+Promote if:\
+cost_per_verified_task decreases by >= 30%\
+AND verification_pass_rate does not decrease\
+AND hallucination_rate does not increase\
+AND result reproduces across 2 runs\
+Rollback\
+Restore previous router policy version.\
+28. Final Long-Term Loop\
+Every run\
+  -> traces\
+  -> labels\
+  -> scores\
+  -> compressed positives/negatives\
+  -> datasets\
+  -> benchmarks\
+  -> Idea PRDs\
+  -> experiments\
+  -> validated improvements\
+  -> better router/prompts/verifiers/local models\
+  -> next run improves\
+29. Key Insight\
+The goal is not to save every trace forever.\
+The goal is to turn every run into structured learning:\
+good answer\
+  -> positive training data\
+\
+wrong answer\
+  -> negative/verifier data\
+\
+expensive success\
+  -> router optimization data\
+\
+repeated failure\
+  -> benchmark or prompt improvement data\
+\
+human correction\
+  -> high-value supervised data\
+\
+verification failure\
+  -> critic/verifier training data\
+DataEvol is the memory and scientific improvement engine for the entire Fractal ecosystem.\
+}

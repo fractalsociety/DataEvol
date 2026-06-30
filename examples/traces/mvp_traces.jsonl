@@ -1,0 +1,3 @@
+{"trace_type":"coding_trace","task_id":"task_ok","agent_id":"worker-a","provider":"openrouter","model":"free-model","prompt":"Fix test for user redaction-fixture@example.invalid with api_key=redaction_fixture_api_key_000000","response":"Implemented fix and tests passed.","tests_run":[{"name":"pytest","status":"passed"}],"metrics":{"cost_usd":0.0,"latency_ms":1200}}
+{"trace_type":"coding_trace","task_id":"task_fail","agent_id":"worker-b","provider":"openrouter","model":"cheap-model","prompt":"Run failing test with token=redaction_fixture_token_000000","response":"Verification failed because test_api failed.","tests_run":[{"name":"pytest","status":"failed"}],"metrics":{"cost_usd":0.02,"latency_ms":2400}}
+

@@ -1,0 +1,30 @@
+{
+  "control": [
+    {
+      "cost_per_verified_task": 1.0,
+      "correctness": 0.92,
+      "verification_pass_rate": 0.9,
+      "safety_score": 1.0
+    },
+    {
+      "cost_per_verified_task": 1.1,
+      "correctness": 0.91,
+      "verification_pass_rate": 0.9,
+      "safety_score": 1.0
+    }
+  ],
+  "variant": [
+    {
+      "cost_per_verified_task": 0.78,
+      "correctness": 0.92,
+      "verification_pass_rate": 0.9,
+      "safety_score": 1.0
+    },
+    {
+      "cost_per_verified_task": 0.82,
+      "correctness": 0.91,
+      "verification_pass_rate": 0.9,
+      "safety_score": 1.0
+    }
+  ]
+}
