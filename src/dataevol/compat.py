@@ -307,7 +307,7 @@ def call_core(
     *,
     config: DataEvolConfig,
 ) -> dict[str, Any]:
-    """Call a future core helper if present; otherwise return a stable stub."""
+    """Dispatch CLI/API operations to implemented core helpers with structured errors."""
     payload = payload or {}
     try:
         known = _call_known_operation(module_name, function_name, payload, config)

@@ -7,6 +7,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Mapping
 
+from dataevol.benchmarks import build_frozen_benchmark
 from dataevol.storage import connect, init_db
 
 
@@ -147,9 +148,20 @@ def run_measured_router_policy_experiment(
             output_dir,
         )
 
-    chunks = _chunks(rows, max(2, spec.reproducibility_requirement))
-    control_metrics = [_aggregate_metrics(chunk) for chunk in chunks]
-    variant_metrics = [_aggregate_metrics(_apply_variant_policy(chunk, profile, variant_provider)) for chunk in chunks]
+    benchmark = freeze_measured_router_policy_benchmark(
+        rows,
+        Path(output_dir) / f"{spec.experiment_id}_benchmark",
+        experiment_id=spec.experiment_id,
+        variant_provider=variant_provider,
+    )
+    execution = run_router_policy_benchmark(
+        benchmark.benchmark_path,
+        profile,
+        variant_provider,
+        reproducibility_requirement=spec.reproducibility_requirement,
+    )
+    control_metrics = execution["control_metrics"]
+    variant_metrics = execution["variant_metrics"]
     comparison = _compare_metrics(control_metrics, variant_metrics)
     primary = comparison[spec.primary_metric]
     regressions = [
@@ -185,10 +197,60 @@ def run_measured_router_policy_experiment(
         "rollback_snapshot": rollback_snapshot,
         "status": "ready_for_gate",
         "measurement_source": "sqlite",
+        "benchmark_path": str(benchmark.benchmark_path),
+        "benchmark_manifest_path": str(benchmark.manifest_path),
+        "benchmark_execution": {
+            "case_count": execution["case_count"],
+            "eligible_variant_cases": execution["eligible_variant_cases"],
+            "control_version": spec.control_version,
+            "variant_version": spec.variant_version,
+            "variant_provider": variant_provider,
+        },
         "variant_provider_profile": profile,
         "evaluated_trace_count": len(rows),
     }
     return _write_report(report, output_dir)
+
+
+def freeze_measured_router_policy_benchmark(
+    rows: list[dict[str, Any]],
+    output_dir: str | Path,
+    *,
+    experiment_id: str = "exp_router_policy_measured",
+    variant_provider: str = "openrouter",
+) -> Any:
+    """Freeze measured trace rows into a benchmark before policy evaluation."""
+    items = [_benchmark_case(row, index, variant_provider) for index, row in enumerate(rows, start=1)]
+    return build_frozen_benchmark(
+        items,
+        output_dir,
+        name=f"{experiment_id}_router_policy",
+        source="measured-traces",
+        overwrite=True,
+    )
+
+
+def run_router_policy_benchmark(
+    benchmark_path: str | Path,
+    provider_profile: Mapping[str, float],
+    variant_provider: str,
+    *,
+    reproducibility_requirement: int = 2,
+) -> dict[str, Any]:
+    """Execute control and variant router policies over a frozen benchmark file."""
+    cases = _read_benchmark_cases(benchmark_path)
+    control_rows = [_row_from_benchmark_case(case, use_variant=False) for case in cases]
+    variant_rows = [
+        _row_from_benchmark_case(case, use_variant=True, provider_profile=provider_profile, variant_provider=variant_provider)
+        for case in cases
+    ]
+    chunk_count = max(2, reproducibility_requirement)
+    return {
+        "case_count": len(cases),
+        "eligible_variant_cases": sum(1 for case in cases if case.get("eligible_for_variant")),
+        "control_metrics": [_aggregate_metrics(chunk) for chunk in _chunks(control_rows, chunk_count)],
+        "variant_metrics": [_aggregate_metrics(chunk) for chunk in _chunks(variant_rows, chunk_count)],
+    }
 
 
 def run_router_policy_experiment(
@@ -268,6 +330,75 @@ def _provider_profile(rows: list[dict[str, Any]], provider: str) -> dict[str, fl
         "safety_score": aggregate["safety_score"],
         "hallucination_rate": aggregate["hallucination_rate"],
     }
+
+
+def _benchmark_case(row: Mapping[str, Any], index: int, variant_provider: str) -> dict[str, Any]:
+    return {
+        "id": row.get("task_id") or f"router_policy_case_{index:03d}",
+        "benchmark_type": "router_policy",
+        "task": row.get("prompt") or row.get("task_id") or f"router policy case {index}",
+        "trace_id": row.get("id"),
+        "run_id": row.get("run_id"),
+        "trace_type": row.get("trace_type"),
+        "provider": row.get("provider"),
+        "model": row.get("model"),
+        "label": row.get("label"),
+        "response": row.get("response"),
+        "eligible_for_variant": _eligible_for_low_risk_variant(row, variant_provider),
+        "control_metrics": {
+            "cost_usd": _float(row.get("measured_cost_usd"), 0.0),
+            "latency_ms": _float(row.get("measured_latency_ms"), 0.0),
+            "correctness": _float(row.get("measured_correctness"), 0.0),
+            "verified": _float(row.get("measured_verified"), 0.0),
+            "safety_score": _float(row.get("measured_safety"), 1.0),
+            "hallucinated": _float(row.get("measured_hallucinated"), 0.0),
+        },
+    }
+
+
+def _read_benchmark_cases(benchmark_path: str | Path) -> list[dict[str, Any]]:
+    path = Path(benchmark_path)
+    cases: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped:
+                cases.append(json.loads(stripped))
+    return cases
+
+
+def _row_from_benchmark_case(
+    case: Mapping[str, Any],
+    *,
+    use_variant: bool,
+    provider_profile: Mapping[str, float] | None = None,
+    variant_provider: str | None = None,
+) -> dict[str, Any]:
+    metrics = case.get("control_metrics") if isinstance(case.get("control_metrics"), Mapping) else {}
+    row = {
+        "trace_type": case.get("trace_type"),
+        "task_id": case.get("id"),
+        "provider": case.get("provider"),
+        "label": case.get("label"),
+        "prompt": case.get("task"),
+        "response": case.get("response"),
+        "measured_cost_usd": _float(metrics.get("cost_usd"), 0.0),
+        "measured_latency_ms": _float(metrics.get("latency_ms"), 0.0),
+        "measured_correctness": _float(metrics.get("correctness"), 0.0),
+        "measured_verified": _float(metrics.get("verified"), 0.0),
+        "measured_safety": _float(metrics.get("safety_score"), 1.0),
+        "measured_hallucinated": _float(metrics.get("hallucinated"), 0.0),
+    }
+    if use_variant and case.get("eligible_for_variant") and provider_profile is not None:
+        row["provider"] = variant_provider
+        row["variant_provider"] = variant_provider
+        row["measured_cost_usd"] = _float(provider_profile.get("cost_usd"), 0.0)
+        row["measured_latency_ms"] = _float(provider_profile.get("latency_ms"), 0.0)
+        row["measured_correctness"] = _float(provider_profile.get("correctness"), 0.0)
+        row["measured_verified"] = _float(provider_profile.get("verification_pass_rate"), 0.0)
+        row["measured_safety"] = _float(provider_profile.get("safety_score"), 1.0)
+        row["measured_hallucinated"] = _float(provider_profile.get("hallucination_rate"), 0.0)
+    return row
 
 
 def _apply_variant_policy(rows: list[dict[str, Any]], profile: dict[str, float], provider: str) -> list[dict[str, Any]]:

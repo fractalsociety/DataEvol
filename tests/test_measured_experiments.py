@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dataevol.compat import call_core
 from dataevol.config import DataEvolConfig
-from dataevol.experiments import run_measured_router_policy_experiment
+from dataevol.experiments import run_measured_router_policy_experiment, run_router_policy_benchmark
 from dataevol.ingest import ingest_jsonl
 from dataevol.label import label_run
 from dataevol.score import score_run
@@ -57,9 +57,22 @@ def test_measured_experiment_can_win_from_observed_provider_performance(tmp_path
 
     assert report["measurement_source"] == "sqlite"
     assert report["evaluated_trace_count"] == 6
+    assert Path(report["benchmark_path"]).exists()
+    assert Path(report["benchmark_manifest_path"]).exists()
+    assert report["benchmark_execution"]["case_count"] == 6
+    assert report["benchmark_execution"]["eligible_variant_cases"] == 5
     assert report["primary_metric_improved"] is True
     assert report["regressions"] == []
     assert report["reproducible_runs"] >= 2
+
+    replay = run_router_policy_benchmark(
+        report["benchmark_path"],
+        report["variant_provider_profile"],
+        "openrouter",
+        reproducibility_requirement=2,
+    )
+    assert replay["case_count"] == 6
+    assert replay["variant_metrics"][0]["cost_per_verified_task"] < replay["control_metrics"][0]["cost_per_verified_task"]
 
 
 def test_measured_experiment_rejects_regressing_variant(tmp_path: Path) -> None:
@@ -92,6 +105,8 @@ def test_measured_experiment_rejects_regressing_variant(tmp_path: Path) -> None:
 
     report = run_measured_router_policy_experiment(db_path, tmp_path / "experiments", run_id=run_id)
 
+    assert Path(report["benchmark_path"]).exists()
+    assert report["benchmark_execution"]["case_count"] == 6
     assert report["primary_metric_improved"] is False
     assert "correctness" in report["regressions"]
     assert report["verification_passed"] is False
@@ -149,6 +164,8 @@ def test_compat_promote_rejects_saved_measured_regression(tmp_path: Path) -> Non
     )
 
     experiment = call_core("evolve", "experiment", {"run_id": run_id}, config=cfg)
+    assert Path(experiment["benchmark_path"]).exists()
+    assert experiment["benchmark_execution"]["case_count"] == 2
     assert experiment["verification_passed"] is False
     assert experiment["regressions"]
 

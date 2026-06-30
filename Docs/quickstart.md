@@ -32,27 +32,21 @@ print(benchmark.manifest_path)
 
 Frozen benchmark manifests reject accidental overwrite and can be hash-checked with `FrozenBenchmarkBuilder().assert_immutable(...)`.
 
-## Run the Router Policy Experiment
+## Run a Measured Router Policy Experiment
 
 ```python
-import json
-from pathlib import Path
-from dataevol.experiments import run_router_policy_experiment
-from dataevol.promotion import PromotionGate
+from dataevol.experiments import run_measured_router_policy_experiment
 
-metrics = json.load(open("examples/benchmarks/router_policy_fixture_metrics.json"))
-Path("out/rollback").mkdir(parents=True, exist_ok=True)
-Path("out/rollback/router_policy_v0.json").write_text('{"version":"v0"}\n')
-report = run_router_policy_experiment(
-    metrics,
+report = run_measured_router_policy_experiment(
+    ".dataevol/dataevol.sqlite3",
     "out/experiments",
-    rollback_snapshot="out/rollback/router_policy_v0.json",
+    run_id=1,
+    variant_provider="openrouter",
 )
-decision = PromotionGate().promote(report, "out/promotions")
-print(decision.promotion_path)
+print(report["benchmark_path"], report["primary_metric_improved"])
 ```
 
-Promotion requires primary metric improvement, no non-regression metric decline, safety and verification pass, at least two reproduced primary wins, and a rollback snapshot.
+The experiment path freezes measured traces into a benchmark, replays control and variant router policies over that frozen file, and then applies the promotion gate. Promotion requires primary metric improvement, no non-regression metric decline, safety and verification pass, at least two reproduced primary wins, and a rollback snapshot.
 
 ## CLI Loop
 
@@ -66,6 +60,8 @@ dataevol dataset build --type router
 dataevol benchmark build --from-runs last_100 --type router
 dataevol synthetic generate
 dataevol evolve reflect --run-id 1
+dataevol evolve experiment --run-id 1 --variant-provider openrouter
+dataevol evolve compare --experiment exp_router_policy_measured
 dataevol report inbox
 dataevol report markdown
 ```

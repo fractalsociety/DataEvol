@@ -36,4 +36,4 @@ opportunities = detect_opportunities([router_biolatent_trace()])
 
 ## Storage Contract
 
-The MVP modules accept plain mappings and file paths. Future SQLite/API storage can call the same builders after loading traces, benchmark rows, or fixture metrics.
+The modules accept plain mappings and file paths, and the CLI/API paths load SQLite traces, freeze measured benchmark rows, and run the same promotion-gated experiment helpers.

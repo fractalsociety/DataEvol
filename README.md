@@ -1,8 +1,8 @@
 # DataEvol
 
-DataEvol is the local CLI/API shell for the MVP trace evolution pipeline described in `Docs/prd 1.rtf`.
+DataEvol is a local CLI/API service for collecting agent traces, labeling and scoring outcomes, building datasets and frozen benchmarks, running measured experiments, and promoting only changes that pass safety and regression gates.
 
-It currently provides the user-facing command and HTTP surfaces while core workers fill in storage, labeling, scoring, compression, dataset, benchmark, and experiment implementations. Commands and endpoints return structured compatibility responses when a core helper is not available yet.
+The project includes implemented storage, ingestion, labeling, scoring, compression, dataset, benchmark, experiment, promotion, reporting, and local adapter training paths. Commands and API endpoints return structured errors when required measured data is missing.
 
 ## Install
 
@@ -23,10 +23,12 @@ dataevol dataset build --type router
 dataevol benchmark build --from-runs last_100
 dataevol evolve reflect --run-id run_001
 dataevol evolve idea-prd --opportunity opp_001
-dataevol evolve experiment --idea ./ideas/opp_001/IDEA_PRD.md
+dataevol evolve experiment --idea ./ideas/opp_001/IDEA_PRD.md --run-id run_001
 dataevol evolve compare --experiment exp_001
 dataevol evolve promote --experiment exp_001
 dataevol evolve reject --experiment exp_001
+dataevol local-model prepare
+dataevol local-model train --execute
 dataevol privacy set private-local-only
 dataevol report runs
 dataevol serve
@@ -74,4 +76,4 @@ curl -X POST http://127.0.0.1:8765/ingest_trace \
   -d '{"trace":{"type":"router_trace","input":"demo"}}'
 ```
 
-See [docs/api.md](docs/api.md).
+See [Docs/api.md](Docs/api.md).
