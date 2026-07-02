@@ -65,3 +65,36 @@ def test_ingest_trace_requires_token_and_ingests(tmp_path: Path) -> None:
     assert body["operation"] == "ingest_trace"
     assert body["accepted"] == 1
     assert body["trace_ids"]
+
+
+def test_ingest_worker_report_requires_token_and_ingests(tmp_path: Path) -> None:
+    cfg = DataEvolConfig(
+        path=tmp_path / "dataevol.toml",
+        db_path=tmp_path / ".dataevol/dataevol.sqlite3",
+        raw_path=tmp_path / ".dataevol/raw",
+        artifacts_path=tmp_path / ".dataevol/artifacts",
+        api_token="secret",
+    )
+    client = TestClient(create_app(cfg))
+    payload = {
+        "report": {
+            "task_id": "task-api-worker-report",
+            "agent_id": "codex-worker-1",
+            "provider": "codex",
+            "summary": "Implemented worker report ingestion.",
+            "changed_files": ["src/dataevol/ingest/importers.py"],
+            "tests_run": [{"command": "pytest tests/test_cli_api.py", "passed": True}],
+            "status": "passed",
+        }
+    }
+
+    unauthorized = client.post("/ingest_worker_report", json=payload)
+    assert unauthorized.status_code == 401
+
+    response = client.post("/ingest_worker_report", headers={"Authorization": "Bearer secret"}, json=payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["operation"] == "ingest_worker_report"
+    assert body["report_count"] == 1
+    assert body["accepted"] == 1
+    assert body["trace_ids"]

@@ -40,6 +40,7 @@ from dataevol.ingest import (
     import_coordinate_run,
     import_fractal_router_decisions,
     parse_openrouter_metadata,
+    worker_report_to_trace,
 )
 from dataevol.integrations import (
     LOCAL_MODEL_METADATA,
@@ -83,6 +84,30 @@ def test_importers_normalization_and_openrouter_metadata(tmp_path: Path) -> None
     assert validate_trace({"type": "router_trace", "input": "demo"}).trace_type == "router_trace"
 
 
+def test_worker_report_to_trace_normalizes_coordinate_completion() -> None:
+    trace = worker_report_to_trace(
+        {
+            "task_id": "task-66",
+            "worker_id": "claude-small-1",
+            "provider": "Claude",
+            "model": "sonnet",
+            "task": {"title": "Add parser"},
+            "summary": "Parser added and tests passed.",
+            "changed_files": ["src/parser.py"],
+            "tests_run": ["pytest tests/test_parser.py"],
+            "risks": ["fixture-only"],
+            "status": "passed",
+        }
+    )
+
+    assert trace["trace_type"] == "worker_trace"
+    assert trace["agent_id"] == "claude-small-1"
+    assert trace["provider"] == "claude"
+    assert trace["files_changed"] == ["src/parser.py"]
+    assert trace["tests_run"] == [{"command": "pytest tests/test_parser.py"}]
+    assert trace["outcome"] == "passed"
+
+
 def test_near_duplicate_and_low_value_repeat_compaction() -> None:
     left = {"id": "a", "prompt": "Fix router timeout test", "response": "pytest passed", "task": "router timeout"}
     right = {"id": "b", "prompt": "Fix the router timeout test", "response": "pytest passed", "task": "router timeout"}
@@ -112,7 +137,8 @@ def test_label_compress_and_scoring_extension_points(tmp_path: Path) -> None:
 
 def test_generic_datasets_benchmarks_router_loop_and_local_exports(tmp_path: Path) -> None:
     traces = [{"id": "t1", "run_id": "r1", "prompt": "route", "label": "accepted", "provider": "openrouter", "score": 0.9, "cost_usd": 0.01}]
-    for dataset_type in DATASET_TYPES - {"local-router", "local-compressor", "local-duplicate-detector", "local-evaluator"}:
+    local_only_types = {dataset_type for dataset_type in DATASET_TYPES if dataset_type.startswith("local-")}
+    for dataset_type in DATASET_TYPES - local_only_types:
         result = build_dataset(dataset_type, traces, tmp_path / "datasets")
         assert result.dataset_path.exists()
     for benchmark_type in BENCHMARK_TYPES:
@@ -126,7 +152,8 @@ def test_generic_datasets_benchmarks_router_loop_and_local_exports(tmp_path: Pat
     assert generate_candidate_router_policy(perf)["preferred_providers"] == ["openrouter"]
 
     local = export_local_training_datasets(traces, tmp_path / "local", opt_in=True)
-    assert set(local) == {"local-router", "local-compressor", "local-duplicate-detector", "local-evaluator"}
+    assert len(local) >= 40
+    assert {"local-ingestor", "local-promotion-gatekeeper", "local-router", "local-model-mix-optimizer"}.issubset(local)
 
 
 def test_synthetic_engine_provenance_and_filters() -> None:
@@ -174,7 +201,7 @@ def test_evolution_idea_experiment_promotion_rejection_and_prompt_local_loops(tm
     prompt_test = ab_test_prompt_packs({"success_rate": 0.8, "hallucination_rate": 0.1}, {"success_rate": 0.9, "hallucination_rate": 0.1})
     assert promote_prompt_pack(prompt_test, tmp_path / "prompts").exists()
 
-    plan = prepare_local_adapter_training(tmp_path / "local", python_bin="python", experts=("router",), count=4, iters=1)
+    plan = prepare_local_adapter_training(tmp_path / "local", python_bin="python", experts=("ingestor",), count=4, iters=1)
     script = plan.script_path.read_text(encoding="utf-8")
     assert plan.manifest_path.exists()
     assert "run_local_adapter_training_from_manifest" in script

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -159,6 +160,29 @@ def _call_known_operation(
             objective=run.get("objective"),
         )
         return _normalize_result(result, function_name)
+
+    if function_name == "ingest_worker_report":
+        from dataevol.ingest import ingest_jsonl, worker_reports_to_traces
+
+        reports = payload.get("reports")
+        if reports is None and isinstance(payload.get("report"), dict):
+            reports = [payload["report"]]
+        if not isinstance(reports, list) or not all(isinstance(report, dict) for report in reports):
+            return None
+        traces = worker_reports_to_traces([dict(report) for report in reports])
+        path = _write_trace_batch(config, "api_ingest_worker_report", traces)
+        result = ingest_jsonl(
+            path,
+            config.db_path,
+            source_system=payload.get("source_system") or "coordinate",
+            privacy_mode=config.privacy_mode,
+            raw_root=config.raw_path,
+            external_run_id=payload.get("external_run_id"),
+            objective=payload.get("objective"),
+        )
+        normalized = _normalize_result(result, function_name)
+        normalized["report_count"] = len(reports)
+        return normalized
 
     if function_name == "label_run":
         from dataevol.label import label_run
@@ -426,7 +450,7 @@ def _call_known_operation(
         if function_name == "prepare":
             plan = prepare_local_adapter_training(
                 output,
-                python_bin=payload.get("python_bin") or "python",
+                python_bin=payload.get("python_bin") or sys.executable,
                 base_model=str(payload.get("base_model") or "mlx-community/Qwen2.5-1.5B-Instruct-4bit"),
                 experts=experts,
                 count=int(payload.get("count") or 24),
@@ -436,7 +460,7 @@ def _call_known_operation(
         if function_name == "train":
             result = run_local_adapter_training(
                 output,
-                python_bin=payload.get("python_bin") or "python",
+                python_bin=payload.get("python_bin") or sys.executable,
                 base_model=str(payload.get("base_model") or "mlx-community/Qwen2.5-1.5B-Instruct-4bit"),
                 experts=experts,
                 count=int(payload.get("count") or 24),

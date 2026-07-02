@@ -1,0 +1,10 @@
+{
+  "acceptance_criteria_score": 0.8,
+  "confidence_faithfulness": 0.9,
+  "escalation_correctness": 0.75,
+  "failure_classification": 0.7,
+  "judge_model": "Qwen/Qwen2.5-72B-Instruct",
+  "provider": "vllm-openai-compatible",
+  "rationale": "The answer states uncertainty in line with the available evidence and does not hide the verification boundary.",
+  "verdict": "pass"
+}
