@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import subprocess
 import sys
 import threading
@@ -16,12 +15,13 @@ from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from dataevol import __version__
 from dataevol.compat import call_core
+from dataevol.api.auth import require_token
 from dataevol.config import DataEvolConfig, load_config
 from dataevol.local_models import EXPERTS, prepare_local_adapter_training
 from dataevol.local_models.layer_specialist import SCHEMA as LAYER_SPECIALIST_SCHEMA
@@ -77,27 +77,6 @@ class IngestWorkerReportRequest(BaseModel):
     source_system: str | None = None
     external_run_id: str | None = None
     objective: str | None = None
-
-
-def _extract_token(authorization: str | None, x_dataevol_token: str | None) -> str | None:
-    if authorization and authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-    return x_dataevol_token
-
-
-def _require_token(config: DataEvolConfig):
-    def dependency(
-        authorization: Annotated[str | None, Header()] = None,
-        x_dataevol_token: Annotated[str | None, Header(alias="X-DataEvol-Token")] = None,
-    ) -> None:
-        supplied = _extract_token(authorization, x_dataevol_token)
-        if not supplied or not secrets.compare_digest(supplied, config.api_token):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing or invalid DataEvol API token.",
-            )
-
-    return dependency
 
 
 def _dashboard_training_experts(payload: dict[str, Any]) -> tuple[str, ...]:
@@ -470,6 +449,21 @@ def _resolve_local_dataset_uri(raw: str) -> Path:
     return path
 
 
+def _resolve_artifact_file_path(raw: str, cfg: DataEvolConfig) -> Path:
+    path = Path(raw or "").expanduser()
+    if not str(path):
+        raise HTTPException(status_code=422, detail="path is required")
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    resolved = path.resolve()
+    roots = [Path.cwd().joinpath(".dataevol").resolve(), cfg.artifacts_path.resolve()]
+    if not any(resolved == root or root in resolved.parents for root in roots):
+        raise HTTPException(status_code=422, detail="artifact path is outside allowed roots")
+    if not resolved.exists() or not resolved.is_file():
+        raise HTTPException(status_code=404, detail="artifact file not found")
+    return resolved
+
+
 def _safe_output_path(raw: str) -> Path:
     path = Path(raw)
     if ".." in path.parts:
@@ -657,7 +651,7 @@ def _run_dashboard_training_job(job_id: str, payload: dict[str, Any]) -> None:
 def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     cfg = config or load_config()
     app = FastAPI(title="DataEvol API", version=__version__)
-    protected = Depends(_require_token(cfg))
+    protected = Depends(require_token(cfg))
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -827,6 +821,11 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     @app.post("/local_model/artifacts/export", dependencies=[protected])
     def local_model_artifacts_export(request: OperationRequest) -> dict[str, Any]:
         return _export_local_model_artifacts(request.payload)
+
+    @app.get("/local_model/artifacts/file", dependencies=[protected])
+    def local_model_artifacts_file(path: Annotated[str, Query()]):
+        resolved = _resolve_artifact_file_path(path, cfg)
+        return FileResponse(resolved)
 
     @app.post("/local_model/training/start", dependencies=[protected])
     def local_model_training_start(request: OperationRequest) -> dict[str, Any]:
