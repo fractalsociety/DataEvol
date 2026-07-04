@@ -41,6 +41,7 @@ def build_manifest(
     param_shapes: dict[str, dict[str, Any]],
     baseline_metric: float | None,
     eval_metric: float | None,
+    quantization: dict[str, Any] | None = None,
     contribution_profile_id: str | None = None,
     contribution_profile_hash: str | None = None,
 ) -> dict[str, Any]:
@@ -68,6 +69,7 @@ def build_manifest(
         "param_shapes": param_shapes,
         "tensor_files": files,
         "sha256": {name: sha256_file(out / name) for name in files},
+        "quantization": quantization,
         "runtime_version": runtime_version(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -130,12 +132,10 @@ def train_layer_specialist(
 
     try:
         import mlx.core as mx
-        import mlx.nn as nn
         import mlx.optimizers as optim
         from mlx_lm import load
-        from safetensors.numpy import save_file
     except Exception as exc:  # pragma: no cover - depends on optional local MLX install.
-        raise RuntimeError(f"MLX specialist training requires mlx, mlx_lm, and safetensors: {exc}") from exc
+        raise RuntimeError(f"MLX specialist training requires mlx and mlx_lm: {exc}") from exc
 
     mx.random.seed(seed)
     model, tokenizer = load(base_model)
@@ -154,12 +154,15 @@ def train_layer_specialist(
 
     baseline_metric = _eval_loss(model, tokenizer, eval_rows, max_seq_len)
     model.freeze()
-    model.unfreeze(f"layers.{layer_index}")
+    layers[layer_index].unfreeze()
+    _assert_only_layer_trainable(model, layer_index)
     optimizer = optim.Adam(learning_rate=learning_rate)
 
     for step in range(1, max_steps + 1):
-        batch = train_rows[(step - 1) % len(train_rows)]
-        loss, grads = nn.value_and_grad(model, lambda m: _loss(m, tokenizer, [batch], max_seq_len))(model)
+        import mlx.nn as nn
+
+        batch = _batch_rows(train_rows, step, batch_size)
+        loss, grads = nn.value_and_grad(model, lambda m: _loss(m, tokenizer, batch, max_seq_len))(model)
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state)
         print(f"step {step} loss {float(loss):.6f}", flush=True)
@@ -173,8 +176,7 @@ def train_layer_specialist(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     tensor_name = f"layer_{layer_index}.safetensors"
-    tensors = {name: _to_numpy(value) for name, value in layer_params.items()}
-    save_file(tensors, str(out / tensor_name))
+    mx.save_safetensors(str(out / tensor_name), layer_params)
     manifest = build_manifest(
         base_model=base_model,
         layer_index=layer_index,
@@ -183,6 +185,7 @@ def train_layer_specialist(
         dataset_uri=dataset_uri,
         output_dir=out,
         tensor_files=[tensor_name],
+        quantization=_detect_quantization(model, base_model),
         trainable_param_names=layer_params.keys(),
         trainable_param_count=trainable_param_count,
         frozen_param_count=frozen_param_count,
@@ -288,6 +291,21 @@ def _layer_parameters(model: Any, layer_index: int) -> dict[str, Any]:
     return params
 
 
+def _assert_only_layer_trainable(model: Any, layer_index: int) -> None:
+    trainable = dict(_flatten_params(model.trainable_parameters()))
+    if not trainable:
+        raise RuntimeError("nothing trainable after layer unfreeze")
+    wanted = f"layers.{layer_index}."
+    unexpected = [name for name in trainable if wanted not in name]
+    if unexpected:
+        raise RuntimeError(f"unexpected trainable parameters outside {wanted}: {unexpected[:8]}")
+
+
+def _batch_rows(rows: list[dict[str, Any]], step: int, batch_size: int) -> list[dict[str, Any]]:
+    start = ((step - 1) * max(1, batch_size)) % len(rows)
+    return [rows[(start + offset) % len(rows)] for offset in range(max(1, batch_size))]
+
+
 def _flatten_params(tree: Any, prefix: str = "") -> list[tuple[str, Any]]:
     if isinstance(tree, dict):
         out: list[tuple[str, Any]] = []
@@ -305,10 +323,32 @@ def _numel(value: Any) -> int:
     return n
 
 
-def _to_numpy(value: Any) -> Any:
-    import numpy as np
+def _detect_quantization(model: Any, base_model: str) -> dict[str, Any] | None:
+    for source in (getattr(model, "config", None), _read_model_config(base_model)):
+        if not source:
+            continue
+        raw = source if isinstance(source, dict) else vars(source)
+        config = raw.get("quantization") or raw.get("quantization_config") or raw
+        if not isinstance(config, dict):
+            continue
+        bits = config.get("bits") or config.get("num_bits")
+        group_size = config.get("group_size") or config.get("q_group_size")
+        if bits is not None or group_size is not None:
+            return {
+                "bits": bits,
+                "group_size": group_size,
+            }
+    return None
 
-    return np.asarray(value)
+
+def _read_model_config(base_model: str) -> dict[str, Any] | None:
+    path = Path(base_model) / "config.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":

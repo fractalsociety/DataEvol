@@ -40,6 +40,8 @@ def test_layer_specialist_dry_run_and_validation(tmp_path: Path) -> None:
     assert client.post("/local_model/layerscope/train_layer_specialist", headers=_auth(), json={"payload": invalid}).status_code == 422
     invalid = dict(payload, dataset_uri=str(tmp_path / "missing.jsonl"))
     assert client.post("/local_model/layerscope/train_layer_specialist", headers=_auth(), json={"payload": invalid}).status_code == 422
+    invalid = dict(payload, dataset_uri="s3://bucket/train.jsonl")
+    assert client.post("/local_model/layerscope/train_layer_specialist", headers=_auth(), json={"payload": invalid}).status_code == 422
     invalid = dict(payload, output="../../../etc")
     assert client.post("/local_model/layerscope/train_layer_specialist", headers=_auth(), json={"payload": invalid}).status_code == 422
     invalid = dict(payload, contribution=-0.3)
@@ -62,6 +64,7 @@ def test_layer_specialist_artifact_export_adds_specialists_without_regressing_ad
         "schema": "dataevol.mlx_layer_specialist.v1",
         "name": "ornith__compression__L14",
         "layer_index": 14,
+        "quantization": {"bits": 8, "group_size": 64},
     }
     (specialist_dir / "ornith__compression__L14.manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (specialist_dir / "layer_14.safetensors").write_bytes(b"layer-tensors")

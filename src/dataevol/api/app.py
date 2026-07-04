@@ -183,9 +183,6 @@ def _export_local_model_artifacts(payload: dict[str, Any]) -> dict[str, Any]:
             "content_base64": base64.b64encode(data).decode("ascii"),
         }
 
-    payload_hash = hashlib.sha256(
-        "|".join(sorted(file["sha256"] for file in exported_files if "sha256" in file)).encode("utf-8")
-    ).hexdigest()
     specialists, specialist_count, specialist_hashes = _export_layer_specialists(output)
     payload_hash = hashlib.sha256(
         "|".join(sorted([file["sha256"] for file in exported_files if "sha256" in file] + specialist_hashes)).encode("utf-8")
@@ -385,6 +382,7 @@ def _run_layer_specialist_job(job_id: str, payload: dict[str, Any]) -> None:
         if returncode != 0:
             raise RuntimeError(f"layer specialist training exited with return code {returncode}")
         manifest_path = final_json.get("manifest_path") if final_json else None
+        manifest = _read_json_file(manifest_path) if manifest_path else None
         _update_training_job(
             job_id,
             status="completed",
@@ -392,6 +390,7 @@ def _run_layer_specialist_job(job_id: str, payload: dict[str, Any]) -> None:
             progress=1.0,
             ok=True,
             manifest_path=manifest_path,
+            manifest=manifest,
         )
         _append_training_log(job_id, "Layer specialist training job completed.")
     except Exception as exc:  # pragma: no cover - exercised by host runner runtime.
@@ -441,6 +440,14 @@ def _optional_arg(name: str, value: Any) -> list[str]:
 def _maybe_json(line: str) -> dict[str, Any] | None:
     try:
         value = json.loads(line)
+        return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+
+
+def _read_json_file(path: str | Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else None
     except Exception:
         return None
