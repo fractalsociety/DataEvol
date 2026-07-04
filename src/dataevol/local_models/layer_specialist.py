@@ -132,20 +132,66 @@ def train_layer_specialist(
 
     try:
         import mlx.core as mx
-        import mlx.optimizers as optim
         from mlx_lm import load
     except Exception as exc:  # pragma: no cover - depends on optional local MLX install.
         raise RuntimeError(f"MLX specialist training requires mlx and mlx_lm: {exc}") from exc
 
     mx.random.seed(seed)
     model, tokenizer = load(base_model)
-    layers = getattr(getattr(model, "model", None), "layers", None)
+    rows = _load_jsonl(dataset_uri)
+    return _train_loaded_model(
+        model=model,
+        tokenizer=tokenizer,
+        base_model=base_model,
+        layer_index=layer_index,
+        rows=rows,
+        dataset_uri=dataset_uri,
+        output_dir=output_dir,
+        task_type=task_type,
+        training_mode=training_mode,
+        learning_rate=learning_rate,
+        batch_size=batch_size,
+        max_steps=max_steps,
+        max_seq_len=max_seq_len,
+        eval_split=eval_split,
+        contribution_profile_id=contribution_profile_id,
+        contribution_profile_hash=contribution_profile_hash,
+    )
+
+
+def _train_loaded_model(
+    *,
+    model: Any,
+    tokenizer: Any,
+    base_model: str,
+    layer_index: int,
+    rows: list[dict[str, Any]],
+    dataset_uri: str,
+    output_dir: str | Path,
+    task_type: str,
+    training_mode: str,
+    learning_rate: float = 1e-5,
+    batch_size: int = 1,
+    max_steps: int = 100,
+    max_seq_len: int = 512,
+    eval_split: float = 0.1,
+    contribution_profile_id: str | None = None,
+    contribution_profile_hash: str | None = None,
+) -> dict[str, Any]:
+    if training_mode == "rl":
+        raise NotImplementedError("RL layer-specialist training is not implemented in phase 1; use training_mode='sft'.")
+    if training_mode != "sft":
+        raise ValueError("training_mode must be sft or rl")
+
+    import mlx.core as mx
+    import mlx.optimizers as optim
+
+    dequantized_module_count = _dequantize_quantized_linears(model)
+    layers = _decoder_layers(model)
     if layers is None:
         raise RuntimeError("loaded model does not expose model.model.layers")
     if layer_index < 0 or layer_index >= len(layers):
         raise ValueError(f"layer_index {layer_index} is outside model layer range 0..{len(layers)-1}")
-
-    rows = _load_jsonl(dataset_uri)
     if not rows:
         raise ValueError("dataset contains no examples")
     split_at = max(1, min(len(rows) - 1, int(len(rows) * (1.0 - eval_split)))) if len(rows) > 1 else 1
@@ -162,7 +208,17 @@ def train_layer_specialist(
         import mlx.nn as nn
 
         batch = _batch_rows(train_rows, step, batch_size)
-        loss, grads = nn.value_and_grad(model, lambda m: _loss(m, tokenizer, batch, max_seq_len))(model)
+        try:
+            loss, grads = nn.value_and_grad(model, lambda m: _loss(m, tokenizer, batch, max_seq_len))(model)
+        except ValueError as exc:
+            if "CustomKernel" in str(exc):
+                raise RuntimeError(
+                    "MLX cannot backpropagate through this model path because one or more custom kernels "
+                    "do not implement VJP. For Ornith, linear-attention layers after or inside the target "
+                    "layer are not trainable with this SFT path; use a full-attention layer near the end "
+                    "of the model or a future local-layer objective."
+                ) from exc
+            raise
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state)
         print(f"step {step} loss {float(loss):.6f}", flush=True)
@@ -195,6 +251,7 @@ def train_layer_specialist(
         contribution_profile_id=contribution_profile_id,
         contribution_profile_hash=contribution_profile_hash,
     )
+    manifest["dequantized_module_count"] = dequantized_module_count
     manifest_path = out / f"{manifest['name']}.manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {"ok": True, "status": "completed", "manifest_path": str(manifest_path), "manifest": manifest}
@@ -281,14 +338,61 @@ def _eval_loss(model: Any, tokenizer: Any, rows: list[dict[str, Any]], max_seq_l
 
 
 def _layer_parameters(model: Any, layer_index: int) -> dict[str, Any]:
-    prefix = f"layers.{layer_index}."
-    params = {name: value for name, value in _flatten_params(model.parameters()) if name.startswith(prefix)}
-    if not params:
-        alt_prefix = f"model.layers.{layer_index}."
-        params = {name: value for name, value in _flatten_params(model.parameters()) if name.startswith(alt_prefix)}
+    needle = f"layers.{layer_index}."
+    params = {name: value for name, value in _flatten_params(model.parameters()) if name.startswith(needle) or f".{needle}" in name}
     if not params:
         raise RuntimeError(f"no parameters matched layer {layer_index}")
     return params
+
+
+def _decoder_layers(model: Any) -> Any:
+    for root in (model, getattr(model, "language_model", None), getattr(model, "model", None)):
+        if root is None:
+            continue
+        candidate = getattr(getattr(root, "model", None), "layers", None)
+        if candidate is not None:
+            return candidate
+        candidate = getattr(root, "layers", None)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _dequantize_quantized_linears(module: Any) -> int:
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    replacements: list[tuple[str, Any]] = []
+    for name, child in module.named_modules():
+        if isinstance(child, nn.QuantizedLinear):
+            weight = mx.dequantize(
+                child.weight,
+                child.scales,
+                child.get("biases"),
+                child.group_size,
+                child.bits,
+                mode=child.mode,
+            )
+            linear = nn.Linear(weight.shape[1], weight.shape[0], bias="bias" in child)
+            linear.weight = weight
+            if "bias" in child:
+                linear.bias = child.bias
+            replacements.append((name, linear))
+    for name, replacement in replacements:
+        _set_module_path(module, name, replacement)
+    return len(replacements)
+
+
+def _set_module_path(root: Any, dotted_path: str, value: Any) -> None:
+    parent = root
+    parts = dotted_path.split(".")
+    for part in parts[:-1]:
+        parent = parent[int(part)] if isinstance(parent, list) else getattr(parent, part)
+    last = parts[-1]
+    if isinstance(parent, list):
+        parent[int(last)] = value
+    else:
+        setattr(parent, last, value)
 
 
 def _assert_only_layer_trainable(model: Any, layer_index: int) -> None:
@@ -311,6 +415,12 @@ def _flatten_params(tree: Any, prefix: str = "") -> list[tuple[str, Any]]:
         out: list[tuple[str, Any]] = []
         for key, value in tree.items():
             next_prefix = f"{prefix}.{key}" if prefix else str(key)
+            out.extend(_flatten_params(value, next_prefix))
+        return out
+    if isinstance(tree, (list, tuple)):
+        out: list[tuple[str, Any]] = []
+        for index, value in enumerate(tree):
+            next_prefix = f"{prefix}.{index}" if prefix else str(index)
             out.extend(_flatten_params(value, next_prefix))
         return out
     return [(prefix, tree)]
