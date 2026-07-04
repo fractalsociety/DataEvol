@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import os
 import re
 import secrets
@@ -11,6 +14,7 @@ import uuid
 from collections import deque
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import HTMLResponse
@@ -20,6 +24,8 @@ from dataevol import __version__
 from dataevol.compat import call_core
 from dataevol.config import DataEvolConfig, load_config
 from dataevol.local_models import EXPERTS, prepare_local_adapter_training
+from dataevol.local_models.layer_specialist import SCHEMA as LAYER_SPECIALIST_SCHEMA
+from dataevol.local_models.layer_specialist import build_manifest as build_layer_specialist_manifest
 from dataevol.rlmf import (
     build_benchmark_fixture,
     build_mlx_lora_manifest,
@@ -36,6 +42,18 @@ DEFAULT_DASHBOARD_OUTPUT = ".dataevol/ornith_9b_experts"
 TRAINING_JOBS: dict[str, dict[str, Any]] = {}
 TRAINING_JOBS_LOCK = threading.Lock()
 ITERATION_RE = re.compile(r"\bIter\s+(\d+)\s*:")
+MAX_ADAPTER_EXPORT_FILE_BYTES = 25 * 1024 * 1024
+ADAPTER_EXPORT_FILES = {
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "adapters.safetensors",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+}
+SPECIALIST_MANIFEST_RE = re.compile(r".+\.manifest\.json$")
 
 
 class OperationRequest(BaseModel):
@@ -110,6 +128,402 @@ def _training_job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
     snapshot["eta_seconds"] = eta
     snapshot["percent"] = round(progress * 100, 1)
     return snapshot
+
+
+def _export_local_model_artifacts(payload: dict[str, Any]) -> dict[str, Any]:
+    output = Path(payload.get("output") or DEFAULT_DASHBOARD_OUTPUT)
+    requested = payload.get("experts")
+    experts = tuple(str(expert) for expert in requested if expert) if isinstance(requested, list) else tuple(EXPERTS)
+    exported_files: list[dict[str, Any]] = []
+    adapters: dict[str, Any] = {}
+    manifest_path = output / "adapter_training_manifest.json"
+
+    for expert in experts:
+        if expert not in EXPERTS:
+            continue
+        adapter_dir = output / "adapters" / expert
+        expert_files: list[dict[str, Any]] = []
+        for path in sorted(adapter_dir.glob("*")) if adapter_dir.exists() else []:
+            if not path.is_file() or path.name not in ADAPTER_EXPORT_FILES:
+                continue
+            size = path.stat().st_size
+            if size > MAX_ADAPTER_EXPORT_FILE_BYTES:
+                expert_files.append({
+                    "relative_path": f"adapters/{expert}/{path.name}",
+                    "path": str(path),
+                    "size_bytes": size,
+                    "skipped": True,
+                    "reason": "file_too_large",
+                })
+                continue
+            data = path.read_bytes()
+            record = {
+                "relative_path": f"adapters/{expert}/{path.name}",
+                "path": str(path),
+                "size_bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "content_base64": base64.b64encode(data).decode("ascii"),
+            }
+            expert_files.append(record)
+            exported_files.append(record)
+        adapters[expert] = {
+            "path": str(adapter_dir),
+            "exists": (adapter_dir / "adapters.safetensors").exists() or (adapter_dir / "adapter_model.safetensors").exists(),
+            "files": expert_files,
+        }
+
+    manifest = None
+    if manifest_path.exists() and manifest_path.stat().st_size <= MAX_ADAPTER_EXPORT_FILE_BYTES:
+        data = manifest_path.read_bytes()
+        manifest = {
+            "relative_path": "adapter_training_manifest.json",
+            "path": str(manifest_path),
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "content_base64": base64.b64encode(data).decode("ascii"),
+        }
+
+    payload_hash = hashlib.sha256(
+        "|".join(sorted(file["sha256"] for file in exported_files if "sha256" in file)).encode("utf-8")
+    ).hexdigest()
+    specialists, specialist_count, specialist_hashes = _export_layer_specialists(output)
+    payload_hash = hashlib.sha256(
+        "|".join(sorted([file["sha256"] for file in exported_files if "sha256" in file] + specialist_hashes)).encode("utf-8")
+    ).hexdigest()
+    return {
+        "ok": True,
+        "schema": "dataevol.local_model_artifact_export.v1",
+        "output": str(output),
+        "experts": list(experts),
+        "manifest": manifest,
+        "adapters": adapters,
+        "specialists": specialists,
+        "file_count": len(exported_files) + specialist_count + (1 if manifest else 0),
+        "payload_hash": payload_hash,
+    }
+
+
+def _export_layer_specialists(output: Path) -> tuple[dict[str, Any], int, list[str]]:
+    root = output / "layerscope"
+    specialists: dict[str, Any] = {}
+    count = 0
+    hashes: list[str] = []
+    if not root.exists():
+        return specialists, count, hashes
+    for layer_dir in sorted(path for path in root.glob("layer_*") if path.is_dir()):
+        manifest_record = None
+        tensor_records: list[dict[str, Any]] = []
+        for path in sorted(layer_dir.glob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(output).as_posix()
+            if path.suffix == ".json" and SPECIALIST_MANIFEST_RE.match(path.name):
+                data = path.read_bytes()
+                manifest_record = {
+                    "relative_path": relative,
+                    "path": str(path),
+                    "size_bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "content_base64": base64.b64encode(data).decode("ascii"),
+                }
+                hashes.append(manifest_record["sha256"])
+                count += 1
+            elif path.suffix == ".safetensors":
+                size = path.stat().st_size
+                if size > MAX_ADAPTER_EXPORT_FILE_BYTES:
+                    tensor_records.append({
+                        "relative_path": relative,
+                        "path": str(path),
+                        "size_bytes": size,
+                        "skipped": True,
+                        "reason": "file_too_large",
+                    })
+                    continue
+                data = path.read_bytes()
+                record = {
+                    "relative_path": relative,
+                    "path": str(path),
+                    "size_bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "content_base64": base64.b64encode(data).decode("ascii"),
+                }
+                tensor_records.append(record)
+                hashes.append(record["sha256"])
+                count += 1
+        specialists[layer_dir.name] = {
+            "path": str(layer_dir),
+            "exists": manifest_record is not None or bool(tensor_records),
+            "manifest": manifest_record,
+            "tensors": tensor_records,
+        }
+    return specialists, count, hashes
+
+
+def _validate_train_layer_specialist(payload: dict[str, Any]) -> dict[str, Any]:
+    layer_index = _non_negative_int(payload.get("layer_index"), "layer_index")
+    training_mode = str(payload.get("training_mode") or "").strip()
+    if training_mode not in {"sft", "rl"}:
+        raise HTTPException(status_code=422, detail="training_mode must be sft or rl")
+    base_model = _required_string(payload.get("base_model") or payload.get("model"), "base_model")
+    output = _required_string(payload.get("output"), "output")
+    task_type = _required_string(payload.get("task_type"), "task_type")
+    dataset_uri = _required_string(payload.get("dataset_uri") or payload.get("dataset"), "dataset_uri")
+    dataset_path = _resolve_local_dataset_uri(dataset_uri)
+    output_path = _safe_output_path(output)
+    contribution = _optional_float(payload.get("contribution"), "contribution")
+    min_contribution = _positive_float(payload.get("min_contribution", 0.5), "min_contribution")
+    if contribution is not None:
+        if contribution <= 0:
+            raise HTTPException(status_code=422, detail="non-positive contribution is not allowed for layer specialist training")
+        if contribution < min_contribution:
+            raise HTTPException(status_code=422, detail=f"contribution {contribution} below min_contribution {min_contribution}")
+    normalized = {
+        "base_model": base_model,
+        "output": str(output_path),
+        "task_type": task_type,
+        "training_mode": training_mode,
+        "layer_index": layer_index,
+        "dataset_uri": str(dataset_path),
+        "execute": bool(payload.get("execute", True)),
+        "learning_rate": _positive_float(payload.get("learning_rate", 1e-5), "learning_rate"),
+        "batch_size": max(1, _positive_int(payload.get("batch_size", 1), "batch_size")),
+        "max_steps": _positive_int(payload.get("max_steps", 100), "max_steps"),
+        "seed": _int_value(payload.get("seed", 17), "seed"),
+        "eval_split": _eval_split(payload.get("eval_split", 0.1)),
+        "max_seq_len": _positive_int(payload.get("max_seq_len", payload.get("max_sequence_length", 512)), "max_seq_len"),
+        "min_contribution": min_contribution,
+        "contribution": contribution,
+        "contribution_profile_id": _optional_string(payload.get("contribution_profile_id")),
+        "contribution_profile_hash": _optional_string(payload.get("contribution_profile_hash")),
+    }
+    return normalized
+
+
+def _plan_train_layer_specialist(payload: dict[str, Any]) -> dict[str, Any]:
+    specialist_output = Path(payload["output"]) / "layerscope" / f"layer_{payload['layer_index']}"
+    command = _layer_specialist_command({**payload, "output": str(specialist_output)})
+    return {
+        "ok": True,
+        "status": "planned",
+        "dry_run": True,
+        "schema": LAYER_SPECIALIST_SCHEMA,
+        "base_model": payload["base_model"],
+        "output": payload["output"],
+        "layer_index": payload["layer_index"],
+        "task_type": payload["task_type"],
+        "training_mode": payload["training_mode"],
+        "dataset_uri": payload["dataset_uri"],
+        "freeze_strategy": "mlx_full_layer",
+        "planned_command": command,
+        "acceptance_criteria": {
+            "trainable_layers": [payload["layer_index"]],
+            "freeze_strategy": "mlx_full_layer",
+            "frozen_layer_count": "N - 1, resolved at train time",
+            "required_manifest_fields": [
+                "schema",
+                "base_model_id",
+                "base_model_hash",
+                "layer_index",
+                "task_type",
+                "training_mode",
+                "freeze_strategy",
+                "dataset_uri",
+                "dataset_hash",
+                "trainable_param_names",
+                "frozen_param_count",
+                "trainable_param_count",
+                "param_shapes",
+                "tensor_files",
+                "sha256",
+                "eval_metric",
+                "baseline_metric",
+                "created_at",
+            ],
+        },
+    }
+
+
+def _build_mlx_specialist_manifest(**kwargs: Any) -> dict[str, Any]:
+    return build_layer_specialist_manifest(**kwargs)
+
+
+def _run_layer_specialist_job(job_id: str, payload: dict[str, Any]) -> None:
+    try:
+        output = Path(payload["output"]) / "layerscope" / f"layer_{payload['layer_index']}"
+        output.mkdir(parents=True, exist_ok=True)
+        command = _layer_specialist_command({**payload, "output": str(output)})
+        _update_training_job(
+            job_id,
+            status="running",
+            started_at=time.time(),
+            current_command=" ".join(command),
+            output=str(output),
+            progress=0.0,
+        )
+        _append_training_log(job_id, "Starting MLX full-layer specialist training.")
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        assert proc.stdout is not None
+        final_json: dict[str, Any] | None = None
+        for line in proc.stdout:
+            _append_training_log(job_id, line)
+            parsed = _maybe_json(line)
+            if parsed:
+                final_json = parsed
+            match = re.search(r"\bstep\s+(\d+)\b", line)
+            if match:
+                step = int(match.group(1))
+                progress = min(0.95, step / max(1, int(payload["max_steps"])))
+                _update_training_job(job_id, current_step=step, progress=progress)
+        returncode = proc.wait()
+        if returncode != 0:
+            raise RuntimeError(f"layer specialist training exited with return code {returncode}")
+        manifest_path = final_json.get("manifest_path") if final_json else None
+        _update_training_job(
+            job_id,
+            status="completed",
+            completed_at=time.time(),
+            progress=1.0,
+            ok=True,
+            manifest_path=manifest_path,
+        )
+        _append_training_log(job_id, "Layer specialist training job completed.")
+    except Exception as exc:  # pragma: no cover - exercised by host runner runtime.
+        _update_training_job(job_id, status="failed", completed_at=time.time(), progress=1.0, ok=False, error=str(exc))
+        _append_training_log(job_id, f"Failed: {exc}")
+
+
+def _layer_specialist_command(payload: dict[str, Any]) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "dataevol.local_models.layer_specialist",
+        "train",
+        "--model",
+        str(payload["base_model"]),
+        "--layer-index",
+        str(payload["layer_index"]),
+        "--data",
+        str(payload["dataset_uri"]),
+        "--output",
+        str(payload["output"]),
+        "--task-type",
+        str(payload["task_type"]),
+        "--training-mode",
+        str(payload["training_mode"]),
+        "--learning-rate",
+        str(payload["learning_rate"]),
+        "--batch-size",
+        str(payload["batch_size"]),
+        "--max-steps",
+        str(payload["max_steps"]),
+        "--max-seq-length",
+        str(payload["max_seq_len"]),
+        "--eval-split",
+        str(payload["eval_split"]),
+        "--seed",
+        str(payload["seed"]),
+        *(_optional_arg("--contribution-profile-id", payload.get("contribution_profile_id"))),
+        *(_optional_arg("--contribution-profile-hash", payload.get("contribution_profile_hash"))),
+    ]
+
+
+def _optional_arg(name: str, value: Any) -> list[str]:
+    return [name, str(value)] if value else []
+
+
+def _maybe_json(line: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(line)
+        return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+
+
+def _resolve_local_dataset_uri(raw: str) -> Path:
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.scheme != "file":
+        raise HTTPException(status_code=422, detail=f"unsupported dataset uri scheme: {parsed.scheme}")
+    path = Path(parsed.path if parsed.scheme == "file" else raw)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=422, detail=f"dataset not found: {path}")
+    return path
+
+
+def _safe_output_path(raw: str) -> Path:
+    path = Path(raw)
+    if ".." in path.parts:
+        raise HTTPException(status_code=422, detail="output path traversal is not allowed")
+    return path
+
+
+def _required_string(value: Any, field: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail=f"{field} is required")
+    return text
+
+
+def _optional_string(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _non_negative_int(value: Any, field: str) -> int:
+    n = _int_value(value, field)
+    if n < 0:
+        raise HTTPException(status_code=422, detail=f"{field} must be a non-negative integer")
+    return n
+
+
+def _positive_int(value: Any, field: str) -> int:
+    n = _int_value(value, field)
+    if n < 1:
+        raise HTTPException(status_code=422, detail=f"{field} must be at least 1")
+    return n
+
+
+def _int_value(value: Any, field: str) -> int:
+    try:
+        return int(value)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"{field} must be an integer") from exc
+
+
+def _optional_float(value: Any, field: str) -> float | None:
+    if value is None:
+        return None
+    return _float_value(value, field)
+
+
+def _positive_float(value: Any, field: str) -> float:
+    n = _float_value(value, field)
+    if n <= 0:
+        raise HTTPException(status_code=422, detail=f"{field} must be positive")
+    return n
+
+
+def _float_value(value: Any, field: str) -> float:
+    try:
+        n = float(value)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"{field} must be a number") from exc
+    if not (n < float("inf") and n > float("-inf")):
+        raise HTTPException(status_code=422, detail=f"{field} must be finite")
+    return n
+
+
+def _eval_split(value: Any) -> float:
+    n = _float_value(value, "eval_split")
+    if n <= 0 or n >= 1:
+        raise HTTPException(status_code=422, detail="eval_split must be between 0 and 1")
+    return n
 
 
 def _update_training_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
@@ -389,6 +803,10 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
             "adapters": adapters,
         }
 
+    @app.post("/local_model/artifacts/export", dependencies=[protected])
+    def local_model_artifacts_export(request: OperationRequest) -> dict[str, Any]:
+        return _export_local_model_artifacts(request.payload)
+
     @app.post("/local_model/training/start", dependencies=[protected])
     def local_model_training_start(request: OperationRequest) -> dict[str, Any]:
         job_id = uuid.uuid4().hex[:12]
@@ -440,6 +858,40 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
                 return {"ok": True, "status": "idle", "job_id": None, "logs": []}
             job = max(TRAINING_JOBS.values(), key=lambda item: item.get("created_at") or 0)
             return _training_job_snapshot(job)
+
+    @app.post("/local_model/layerscope/train_layer_specialist", dependencies=[protected])
+    def local_model_layerscope_train_layer_specialist(request: OperationRequest) -> dict[str, Any]:
+        payload = _validate_train_layer_specialist(request.payload)
+        if not payload.get("execute", True):
+            return _plan_train_layer_specialist(payload)
+        job_id = uuid.uuid4().hex[:12]
+        job = {
+            "ok": True,
+            "job_id": job_id,
+            "job_type": "layerscope_train_layer_specialist",
+            "status": "queued",
+            "created_at": time.time(),
+            "started_at": None,
+            "completed_at": None,
+            "progress": 0.0,
+            "percent": 0.0,
+            "layer_index": payload["layer_index"],
+            "task_type": payload["task_type"],
+            "training_mode": payload["training_mode"],
+            "manifest_path": None,
+            "error": None,
+            "logs": deque(maxlen=160),
+        }
+        with TRAINING_JOBS_LOCK:
+            TRAINING_JOBS[job_id] = job
+        thread = threading.Thread(
+            target=_run_layer_specialist_job,
+            args=(job_id, dict(payload)),
+            name=f"dataevol-specialist-{job_id}",
+            daemon=True,
+        )
+        thread.start()
+        return _training_job_snapshot(job)
 
     @app.post("/rlmf/prepare", dependencies=[protected])
     def rlmf_prepare(request: OperationRequest) -> dict[str, Any]:

@@ -184,6 +184,22 @@ def test_local_models_compat_cli_and_api_are_wired(tmp_path: Path) -> None:
     assert "router" in status.json()["datasets"]
     assert "promotion_gatekeeper" in status.json()["datasets"]
 
+    adapter_dir = output / "adapters" / "ingestor"
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    adapter_file = adapter_dir / "adapters.safetensors"
+    adapter_file.write_bytes(b"fake-adapter")
+    export = client.post(
+        "/local_model/artifacts/export",
+        headers={"Authorization": "Bearer secret"},
+        json={"payload": {"output": str(output), "experts": ["ingestor"]}},
+    )
+    assert export.status_code == 200
+    exported = export.json()
+    assert exported["schema"] == "dataevol.local_model_artifact_export.v1"
+    assert exported["adapters"]["ingestor"]["exists"] is True
+    assert exported["adapters"]["ingestor"]["files"][0]["relative_path"] == "adapters/ingestor/adapters.safetensors"
+    assert exported["adapters"]["ingestor"]["files"][0]["content_base64"]
+
     missing_job = client.post(
         "/local_model/training/status",
         headers={"Authorization": "Bearer secret"},

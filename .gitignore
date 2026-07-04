@@ -16,3 +16,5 @@ locks/
 *.sqlite3
 *.db
 *.safetensors
+**/*.manifest.json
+!tests/fixtures/**/*.manifest.json
