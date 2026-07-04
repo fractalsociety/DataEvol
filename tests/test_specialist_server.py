@@ -65,6 +65,52 @@ def test_specialist_server_lifecycle_generate_and_chat_contract(tmp_path: Path) 
     assert "streaming is not supported" in streaming.text
 
 
+def test_specialist_server_loads_manifest_and_tensors_from_urls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = {
+        "schema": SCHEMA,
+        "name": "tiny__compression__L1",
+        "base_model_id": "tiny-qwen",
+        "base_model_hash": None,
+        "layer_index": 1,
+        "task_type": "compression",
+        "training_mode": "sft",
+        "freeze_strategy": FREEZE_STRATEGY,
+        "tensor_files": ["layer_1.safetensors"],
+        "sha256": {"layer_1.safetensors": hashlib.sha256(b"tensor-bytes").hexdigest()},
+        "trainable_param_names": [],
+        "param_shapes": {},
+    }
+    payloads = {
+        "http://artifact.test/manifest.json": json.dumps(manifest).encode("utf-8"),
+        "http://artifact.test/layer_1.safetensors": b"tensor-bytes",
+    }
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001
+        url = request.full_url
+        return _FakeResponse(payloads[url])
+
+    monkeypatch.setattr("dataevol.specialist_server.app.urlopen", fake_urlopen)
+    host = _FakeHost()
+    host.swapper = _RecordingSwapper()
+    client = TestClient(create_server_app(_cfg(tmp_path), host=host))
+    loaded = client.post(
+        "/specialists/load",
+        headers={"Authorization": "Bearer secret"},
+        json={"payload": {
+            "manifest_url": "http://artifact.test/manifest.json",
+            "tensor_urls": {"layer_1.safetensors": "http://artifact.test/layer_1.safetensors"},
+        }},
+    )
+    assert loaded.status_code == 200
+    body = loaded.json()
+    assert body["ok"] is True
+    assert body["verified"] is True
+    assert body["manifest_path"].endswith("manifest.json")
+    registered_path = Path(body["manifest_path"])
+    assert registered_path.exists()
+    assert (registered_path.parent / "layer_1.safetensors").read_bytes() == b"tensor-bytes"
+
+
 def test_mlx_swapper_validates_activates_restores_and_switches_layers(tmp_path: Path) -> None:
     mx = pytest.importorskip("mlx.core")
     model = _tiny_model()
@@ -209,6 +255,54 @@ class _FakeHost:
             "completion_tokens": 2,
             "latency_ms": 3,
         }
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+        self._offset = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> None:  # noqa: ANN002
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        if self._offset >= len(self._body):
+            return b""
+        if size < 0:
+            size = len(self._body) - self._offset
+        chunk = self._body[self._offset:self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+
+class _RecordingSwapper:
+    def register(self, manifest_path: Path):
+        path = Path(manifest_path)
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        tensor = path.parent / manifest["tensor_files"][0]
+        assert tensor.exists()
+
+        class Loaded:
+            def __init__(self) -> None:
+                self.name = manifest["name"]
+                self.manifest_path = str(path)
+                self.manifest_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.layer_index = manifest["layer_index"]
+                self.task_type = manifest["task_type"]
+                self.base_model_id = manifest["base_model_id"]
+                self.tensor_bytes = tensor.stat().st_size
+                self.verified = True
+                self.loaded_at = "2026-07-03T00:00:00+00:00"
+                self.active = False
+                self.dtype_cast = False
+
+        return Loaded()
+
+    def list(self) -> list[dict[str, object]]:
+        return []
 
 
 def _cfg(tmp_path: Path) -> DataEvolConfig:

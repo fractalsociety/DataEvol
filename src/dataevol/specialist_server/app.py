@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -67,7 +71,7 @@ def create_server_app(config: DataEvolConfig | None = None, host: ModelHost | No
             raise HTTPException(status_code=409, detail="model not loaded")
         locked()
         try:
-            manifest_path = _guard_manifest_path(str(request.payload.get("manifest_path") or ""), cfg)
+            manifest_path = _specialist_manifest_path(request.payload, cfg)
             record = model_host.swapper.register(manifest_path)
             return {"ok": True, **record.__dict__}
         except FileNotFoundError as exc:
@@ -200,3 +204,60 @@ def _guard_manifest_path(raw: str, cfg: DataEvolConfig) -> Path:
     if not path.exists():
         raise FileNotFoundError(str(path))
     return path
+
+
+def _specialist_manifest_path(payload: dict[str, Any], cfg: DataEvolConfig) -> Path:
+    manifest_url = str(payload.get("manifest_url") or "").strip()
+    if not manifest_url:
+        return _guard_manifest_path(str(payload.get("manifest_path") or ""), cfg)
+    return _download_specialist_bundle(manifest_url, payload, cfg)
+
+
+def _download_specialist_bundle(manifest_url: str, payload: dict[str, Any], cfg: DataEvolConfig) -> Path:
+    cache_root = cfg.artifacts_path / "layerscope_remote_specialists" / hashlib.sha256(manifest_url.encode("utf-8")).hexdigest()[:24]
+    cache_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = cache_root / "manifest.json"
+    _download_url(manifest_url, manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tensor_urls = payload.get("tensor_urls") or {}
+    if isinstance(tensor_urls, list):
+        tensor_urls = {Path(str(urlparse(str(url)).path)).name: str(url) for url in tensor_urls}
+    if not isinstance(tensor_urls, dict):
+        raise ValueError("tensor_urls must be an object mapping tensor file names to URLs")
+    single_tensor_url = str(payload.get("tensor_url") or "").strip()
+    tensor_files = [str(item) for item in manifest.get("tensor_files") or []]
+    if single_tensor_url and len(tensor_files) == 1 and tensor_files[0] not in tensor_urls:
+        tensor_urls[tensor_files[0]] = single_tensor_url
+    for tensor_file in tensor_files:
+        rel = _safe_relative_tensor_path(tensor_file)
+        url = str(tensor_urls.get(tensor_file) or tensor_urls.get(rel.name) or "").strip()
+        if not url:
+            raise ValueError(f"missing tensor URL for {tensor_file}")
+        _download_url(url, cache_root / rel)
+    return manifest_path
+
+
+def _safe_relative_tensor_path(raw: str) -> Path:
+    path = Path(raw)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"unsafe tensor file path: {raw}")
+    return path
+
+
+def _download_url(url: str, destination: Path) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("only http(s) artifact URLs are supported")
+    max_bytes = int(os.environ.get("SPECIALIST_REMOTE_ARTIFACT_MAX_BYTES", str(2 * 1024 * 1024 * 1024)))
+    request = Request(url, headers={"User-Agent": "dataevol-specialist-server/1"})
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with urlopen(request, timeout=float(os.environ.get("SPECIALIST_REMOTE_ARTIFACT_TIMEOUT_S", "120"))) as response, destination.open("wb") as fh:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("remote specialist artifact exceeds size limit")
+            fh.write(chunk)
