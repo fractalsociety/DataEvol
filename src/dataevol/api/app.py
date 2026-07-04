@@ -37,8 +37,9 @@ from dataevol.rlmf import (
 )
 
 
+DEFAULT_TRAINABLE_LAYER_MODEL = "mlx-community/Qwen3-0.6B-4bit"
 ORNITH_9B_MODEL_PATH = ".dataevol/models/Ornith-1.0-9B-8bit"
-DEFAULT_DASHBOARD_OUTPUT = ".dataevol/ornith_9b_experts"
+DEFAULT_DASHBOARD_OUTPUT = ".dataevol/qwen3_0_6b_experts"
 TRAINING_JOBS: dict[str, dict[str, Any]] = {}
 TRAINING_JOBS_LOCK = threading.Lock()
 ITERATION_RE = re.compile(r"\bIter\s+(\d+)\s*:")
@@ -128,6 +129,12 @@ def _training_job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
     snapshot["eta_seconds"] = eta
     snapshot["percent"] = round(progress * 100, 1)
     return snapshot
+
+
+def _model_available(model: str) -> bool:
+    if Path(model).expanduser().exists():
+        return True
+    return "/" in model and not model.startswith((".", "/", "~"))
 
 
 def _export_local_model_artifacts(payload: dict[str, Any]) -> dict[str, Any]:
@@ -776,7 +783,7 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     @app.post("/local_model/status", dependencies=[protected])
     def local_model_status(request: OperationRequest) -> dict[str, Any]:
         output = Path(request.payload.get("output") or DEFAULT_DASHBOARD_OUTPUT)
-        model_path = Path(request.payload.get("model") or ORNITH_9B_MODEL_PATH)
+        selected_model = str(request.payload.get("model") or DEFAULT_TRAINABLE_LAYER_MODEL)
         adapters = {}
         datasets = {}
         for expert in EXPERTS:
@@ -797,13 +804,20 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
             "experts": list(EXPERTS),
             "models": [
                 {
+                    "id": DEFAULT_TRAINABLE_LAYER_MODEL,
+                    "label": "Qwen3 0.6B MLX 4-bit",
+                    "exists": _model_available(DEFAULT_TRAINABLE_LAYER_MODEL),
+                    "recommended_for": "layer-specialist training",
+                },
+                {
                     "id": ORNITH_9B_MODEL_PATH,
                     "label": "Ornith 1.0 9B MLX 8-bit",
-                    "exists": Path(ORNITH_9B_MODEL_PATH).exists(),
-                }
+                    "exists": _model_available(ORNITH_9B_MODEL_PATH),
+                    "recommended_for": "inference/serving experiments; middle layers hit MLX custom-kernel VJP limits",
+                },
             ],
-            "selected_model": str(model_path),
-            "model_exists": model_path.exists(),
+            "selected_model": selected_model,
+            "model_exists": _model_available(selected_model),
             "output": str(output),
             "manifest_exists": (output / "adapter_training_manifest.json").exists(),
             "datasets": datasets,
@@ -1225,7 +1239,8 @@ def _dashboard_html() -> str:
       <div class="field">
         <label for="model">Model</label>
         <select id="model">
-          <option value="{ORNITH_9B_MODEL_PATH}" selected>Ornith 1.0 9B MLX 8-bit</option>
+          <option value="{DEFAULT_TRAINABLE_LAYER_MODEL}" selected>Qwen3 0.6B MLX 4-bit</option>
+          <option value="{ORNITH_9B_MODEL_PATH}">Ornith 1.0 9B MLX 8-bit</option>
         </select>
       </div>
       <div class="field">
@@ -1334,7 +1349,7 @@ def _dashboard_html() -> str:
       return data;
     }}
     function renderStatus(data) {{
-      $("modelStatus").textContent = data.model_exists ? "Ornith model ready" : "Ornith model missing";
+      $("modelStatus").textContent = data.model_exists ? "Model ready/configured" : "Local model path missing";
       $("modelStatus").className = `pill ${{data.model_exists ? "ok" : "warn"}}`;
       $("jobOutput").textContent = data.output || $("output").value;
       const names = data.experts || [];

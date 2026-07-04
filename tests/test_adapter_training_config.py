@@ -165,7 +165,7 @@ def test_local_models_compat_cli_and_api_are_wired(tmp_path: Path) -> None:
     dashboard = client.get("/dashboard")
     assert dashboard.status_code == 200
     assert "DataEvol Local Expert Training" in dashboard.text
-    assert "Ornith 1.0 9B MLX 8-bit" in dashboard.text
+    assert "Qwen3 0.6B MLX 4-bit" in dashboard.text
     assert "ingestor" in dashboard.text
     assert "model_mix_optimizer" in dashboard.text
     assert "promotion_gatekeeper" in dashboard.text
@@ -176,7 +176,7 @@ def test_local_models_compat_cli_and_api_are_wired(tmp_path: Path) -> None:
     status = client.post(
         "/local_model/status",
         headers={"Authorization": "Bearer secret"},
-        json={"payload": {"output": str(output), "model": ".dataevol/models/Ornith-1.0-9B-8bit"}},
+        json={"payload": {"output": str(output), "model": "mlx-community/Qwen3-0.6B-4bit"}},
     )
     assert status.status_code == 200
     assert status.json()["experts"][0] == "ingestor"

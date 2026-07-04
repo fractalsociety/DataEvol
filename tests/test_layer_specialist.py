@@ -21,7 +21,7 @@ def test_layer_specialist_dry_run_and_validation(tmp_path: Path) -> None:
     dataset = tmp_path / "train.jsonl"
     dataset.write_text(json.dumps({"prompt": "a", "completion": "b"}) + "\n", encoding="utf-8")
     payload = {
-        "base_model": "mlx-community/Ornith-1.0-9B",
+        "base_model": "mlx-community/Qwen3-0.6B-4bit",
         "output": str(tmp_path / "out"),
         "task_type": "compression",
         "training_mode": "sft",
@@ -69,11 +69,11 @@ def test_layer_specialist_artifact_export_adds_specialists_without_regressing_ad
     specialist_dir.mkdir(parents=True)
     manifest = {
         "schema": "dataevol.mlx_layer_specialist.v1",
-        "name": "ornith__compression__L14",
+        "name": "qwen3__compression__L14",
         "layer_index": 14,
-        "quantization": {"bits": 8, "group_size": 64},
+        "quantization": {"bits": 4, "group_size": 64},
     }
-    (specialist_dir / "ornith__compression__L14.manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (specialist_dir / "qwen3__compression__L14.manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (specialist_dir / "layer_14.safetensors").write_bytes(b"layer-tensors")
 
     res = client.post(
