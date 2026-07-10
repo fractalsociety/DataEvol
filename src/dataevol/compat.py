@@ -509,6 +509,11 @@ def _call_known_operation(
                 report["markdown_path"] = str(path)
             return _normalize_result(report, function_name)
 
+    if module_name == "harness":
+        from dataevol.harness.dispatch import run_harness_operation
+
+        return run_harness_operation(function_name, payload, config)
+
     return None
 
 

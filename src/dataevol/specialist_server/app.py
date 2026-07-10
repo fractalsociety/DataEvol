@@ -138,6 +138,7 @@ def create_server_app(config: DataEvolConfig | None = None, host: ModelHost | No
             active = model_host.swapper.registry.get(model_host.swapper.active) if model_host.swapper and model_host.swapper.active else None
             if request.payload.get("restore_after") is True and model_host.swapper:
                 model_host.swapper.restore_base()
+            _post_trait_telemetry(model_host, request.payload, body, active)
             return {
                 "ok": True,
                 "schema": "dataevol.specialist_generation.v1",
@@ -261,3 +262,54 @@ def _download_url(url: str, destination: Path) -> None:
             if total > max_bytes:
                 raise ValueError("remote specialist artifact exceeds size limit")
             fh.write(chunk)
+
+
+def _post_trait_telemetry(model_host: ModelHost, payload: dict[str, Any], generation: dict[str, Any], active: Any | None) -> None:
+    if os.environ.get("TELEMETRY_TRAITS") not in {"1", "true", "TRUE", "yes"}:
+        return
+    endpoint = os.environ.get("TRAIT_EVIDENCE_URL") or os.environ.get("FRACTALWORK_TRAIT_EVIDENCE_URL")
+    if not endpoint:
+        return
+    layer_index = active.layer_index if active else payload.get("layer_index")
+    num_layers = max(1, int(getattr(model_host, "num_layers", 1) or 1))
+    try:
+        layer = int(layer_index) if layer_index is not None else 0
+    except (TypeError, ValueError):
+        layer = 0
+    buckets = max(1, int(os.environ.get("TRAIT_REGION_BUCKETS", "16")))
+    depth_bucket = max(0, min(buckets - 1, round((layer / max(1, num_layers - 1)) * (buckets - 1))))
+    soul_id = payload.get("soul_id") or payload.get("soulId") or payload.get("agent_id") or payload.get("agentId")
+    if not soul_id and active:
+        soul_id = active.name
+    event = {
+        "soulId": str(soul_id or "specialist-server"),
+        "genomeHash": str(payload.get("genome_hash") or payload.get("genomeHash") or (active.manifest_hash if active else _hash_text(str(payload.get("model") or model_host.base_model or "base")))),
+        "epoch": int(payload.get("epoch") or payload.get("life_epoch") or 0),
+        "taskType": str(payload.get("task_type") or payload.get("taskType") or (active.task_type if active else "generation")),
+        "depthBucket": depth_bucket,
+        "source": "telemetry",
+        "value": _telemetry_value(generation),
+        "subRegion": None,
+    }
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("FRACTALWORK_TRAIT_EVIDENCE_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = Request(endpoint, data=json.dumps({"events": [event]}).encode("utf-8"), headers=headers, method="POST")
+        with urlopen(req, timeout=float(os.environ.get("TRAIT_EVIDENCE_TIMEOUT_S", "2"))) as response:
+            response.read()
+    except Exception:
+        return
+
+
+def _telemetry_value(generation: dict[str, Any]) -> float:
+    token_count = generation.get("completion_tokens") or generation.get("tokens") or 1
+    try:
+        return max(0.0, min(1.0, float(token_count) / 256.0))
+    except (TypeError, ValueError):
+        return 0.01
+
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()

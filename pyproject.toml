@@ -28,6 +28,10 @@ train = [
   "mlx-lm>=0.31,<1.0",
   "safetensors>=0.4,<1.0",
 ]
+harness = [
+  # Harness Evolver v1 uses only the stdlib (urllib HTTP client, pure-Python
+  # bootstrap). Reserved for a future real sandbox backend (e.g. docker).
+]
 
 [project.scripts]
 dataevol = "dataevol.cli:main"

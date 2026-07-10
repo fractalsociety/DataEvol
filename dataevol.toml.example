@@ -8,3 +8,12 @@ token = "dev-local-token"
 
 [privacy]
 mode = "private-local-only"
+
+# Optional: required only for `dataevol harness` model-driven commands.
+# Prefer OPENROUTER_API_KEY or DATAEVOL_MODEL_API_KEY for real secrets.
+# [model]
+# provider = "openrouter"
+# endpoint = "https://openrouter.ai/api/v1/chat/completions"
+# api_key = ""
+# name = "anthropic/claude-sonnet-4"
+# judge_name = "openai/gpt-4o"

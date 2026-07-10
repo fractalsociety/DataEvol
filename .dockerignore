@@ -1,0 +1,8 @@
+.dataevol/
+.pytest_cache/
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/

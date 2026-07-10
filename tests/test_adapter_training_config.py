@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from dataevol.api.app import create_app
+from dataevol.api.app import _training_job_snapshot, create_app
 from dataevol.cli.main import app
 from dataevol.compat import call_core
 from dataevol.config import DataEvolConfig
@@ -214,3 +214,17 @@ def test_local_models_compat_cli_and_api_are_wired(tmp_path: Path) -> None:
     )
     assert latest_job.status_code == 200
     assert latest_job.json()["status"] == "idle"
+
+
+def test_training_job_snapshot_reports_gpu_seconds() -> None:
+    snap = _training_job_snapshot({
+        "job_id": "job-gpu",
+        "status": "running",
+        "created_at": 100.0,
+        "started_at": 100.0,
+        "progress": 0.5,
+        "gpu_device_factor": 2.0,
+        "logs": [],
+    })
+    assert snap["gpu_seconds"] >= 0
+    assert "elapsed_seconds" in snap

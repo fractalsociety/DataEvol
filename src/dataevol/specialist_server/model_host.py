@@ -79,6 +79,7 @@ class ModelHost:
             verbose=False,
         )
         elapsed = max(0, int((time.time() - started) * 1000))
+        gpu_seconds = max(0.0, (elapsed / 1000.0) * float(__import__("os").environ.get("DATAEVOL_GPU_DEVICE_FACTOR") or 1.0))
         prompt_tokens = len(self.tokenizer.encode(prompt)) if hasattr(self.tokenizer, "encode") else 0
         completion_tokens = len(self.tokenizer.encode(text)) if hasattr(self.tokenizer, "encode") else 0
         return {
@@ -86,4 +87,5 @@ class ModelHost:
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "latency_ms": elapsed,
+            "gpu_seconds": round(gpu_seconds, 6),
         }

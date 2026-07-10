@@ -105,9 +105,21 @@ def _training_job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
     }
     snapshot["logs"] = list(job.get("logs") or [])
     snapshot["elapsed_seconds"] = elapsed
+    snapshot["gpu_seconds"] = round(elapsed * _gpu_device_factor(job), 6)
     snapshot["eta_seconds"] = eta
     snapshot["percent"] = round(progress * 100, 1)
     return snapshot
+
+
+def _gpu_device_factor(job: dict[str, Any]) -> float:
+    raw = job.get("gpu_device_factor") or os.environ.get("DATAEVOL_GPU_DEVICE_FACTOR") or 1.0
+    try:
+        factor = float(raw)
+    except Exception:
+        return 1.0
+    if factor < 0 or factor == float("inf") or factor == float("-inf"):
+        return 1.0
+    return factor
 
 
 def _model_available(model: str) -> bool:
@@ -844,6 +856,7 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
             "completed_experts": 0,
             "total_experts": 0,
             "total_iters": 0,
+            "gpu_device_factor": float(request.payload.get("gpu_device_factor") or os.environ.get("DATAEVOL_GPU_DEVICE_FACTOR") or 1.0),
             "manifest_path": None,
             "script_path": None,
             "error": None,
@@ -991,6 +1004,25 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     @app.get("/promotions")
     def promotions() -> dict[str, Any]:
         return call_core("reports", "promotions", {}, config=cfg)
+
+    # --- Harness Evolver ----------------------------------------------------
+    for _harness_op in ("design", "benchmark", "evaluate", "failures", "mutate", "judge", "evolve"):
+
+        @app.post(f"/harness/{_harness_op}", dependencies=[protected], name=f"harness_{_harness_op}")
+        def _harness_endpoint(request: OperationRequest, _op: str = _harness_op) -> dict[str, Any]:
+            return call_core("harness", _op, request.payload, config=cfg)
+
+    @app.get("/harness/lineage")
+    def harness_lineage() -> dict[str, Any]:
+        return call_core("harness", "lineage", {}, config=cfg)
+
+    @app.get("/harness/incumbent")
+    def harness_incumbent() -> dict[str, Any]:
+        return call_core("harness", "incumbent", {}, config=cfg)
+
+    @app.get("/harness/training_records")
+    def harness_training_records() -> dict[str, Any]:
+        return call_core("harness", "training_records", {}, config=cfg)
 
     return app
 

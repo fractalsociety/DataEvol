@@ -1,0 +1,14 @@
+{
+  "task_type": "permit_set_review",
+  "description": "Review a construction permit drawing set for code compliance and missing items.",
+  "modality": "vision+text",
+  "required_tools": ["building_code_search", "drawing_measurement"],
+  "tolerance_for_errors": "low",
+  "budget_usd_per_task": 0.25,
+  "latency_target_ms": 8000,
+  "context_length": "long",
+  "data_sensitivity": "confidential",
+  "evaluation_type": "paired_benchmark",
+  "expected_outputs": ["permit_review_report_v2"],
+  "known_failure_modes": ["cross_sheet_conflicts", "missing_dimensions", "code_section_mismatch"]
+}

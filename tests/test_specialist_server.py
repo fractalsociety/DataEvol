@@ -40,6 +40,7 @@ def test_specialist_server_lifecycle_generate_and_chat_contract(tmp_path: Path) 
     assert generated.status_code == 200
     assert generated.json()["text"] == "generated:hello"
     assert generated.json()["specialist"] == "base"
+    assert generated.json()["gpu_seconds"] == 0.003
 
     chat = client.post(
         "/v1/chat/completions",
@@ -109,6 +110,41 @@ def test_specialist_server_loads_manifest_and_tensors_from_urls(tmp_path: Path, 
     registered_path = Path(body["manifest_path"])
     assert registered_path.exists()
     assert (registered_path.parent / "layer_1.safetensors").read_bytes() == b"tensor-bytes"
+
+
+def test_specialist_server_posts_trait_telemetry_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    posted: list[dict[str, object]] = []
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001
+        posted.append({
+            "url": request.full_url,
+            "body": json.loads(request.data.decode("utf-8")),
+            "timeout": timeout,
+        })
+        return _FakeResponse(b'{"ok":true}')
+
+    monkeypatch.setenv("TELEMETRY_TRAITS", "1")
+    monkeypatch.setenv("TRAIT_EVIDENCE_URL", "http://fractalwork.test/v1/life/trait-evidence")
+    monkeypatch.setattr("dataevol.specialist_server.app.urlopen", fake_urlopen)
+    host = _FakeHost()
+    client = TestClient(create_server_app(_cfg(tmp_path), host=host))
+    headers = {"Authorization": "Bearer secret"}
+    client.post("/model/load", headers=headers, json={"payload": {"base_model": "tiny-qwen"}})
+
+    response = client.post(
+        "/generate",
+        headers=headers,
+        json={"payload": {"prompt": "hello", "max_tokens": 4, "soulId": "agent-1", "genomeHash": "a" * 64, "taskType": "compression", "layer_index": 1}},
+    )
+
+    assert response.status_code == 200
+    assert posted[0]["url"] == "http://fractalwork.test/v1/life/trait-evidence"
+    event = posted[0]["body"]["events"][0]
+    assert event["soulId"] == "agent-1"
+    assert event["genomeHash"] == "a" * 64
+    assert event["taskType"] == "compression"
+    assert event["source"] == "telemetry"
+    assert event["depthBucket"] == 15
 
 
 def test_mlx_swapper_validates_activates_restores_and_switches_layers(tmp_path: Path) -> None:
@@ -254,6 +290,7 @@ class _FakeHost:
             "prompt_tokens": 1,
             "completion_tokens": 2,
             "latency_ms": 3,
+            "gpu_seconds": 0.003,
         }
 
 

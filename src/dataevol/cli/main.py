@@ -25,6 +25,7 @@ report_app = typer.Typer(help="Report commands.")
 local_model_app = typer.Typer(help="Local model adapter commands.")
 prompt_app = typer.Typer(help="Prompt pack commands.")
 integration_app = typer.Typer(help="Integration client commands.")
+harness_app = typer.Typer(help="Harness evolver commands.")
 
 app.add_typer(dataset_app, name="dataset")
 app.add_typer(benchmark_app, name="benchmark")
@@ -35,6 +36,7 @@ app.add_typer(report_app, name="report")
 app.add_typer(local_model_app, name="local-model")
 app.add_typer(prompt_app, name="prompt")
 app.add_typer(integration_app, name="integration")
+app.add_typer(harness_app, name="harness")
 
 
 def _print_result(result: dict[str, Any]) -> None:
@@ -422,6 +424,98 @@ def serve(
     import uvicorn
 
     uvicorn.run(create_app(load_config(config)), host=host, port=port)
+
+
+@harness_app.command("evolve")
+def harness_evolve(
+    task: Annotated[str, typer.Option("--task", help="Task spec: JSON object, JSON string, or path to a .json file.")],
+    max_generations: Annotated[int, typer.Option("--max-generations")] = 20,
+    number_of_candidates: Annotated[int, typer.Option("--number-of-candidates")] = 8,
+    repeated_runs: Annotated[int, typer.Option("--repeated-runs")] = 3,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Run the harness evolution loop (requires a configured [model] backend)."""
+    _print_result(call_core("harness", "evolve", {
+        "task": task, "max_generations": max_generations,
+        "number_of_candidates": number_of_candidates, "repeated_runs": repeated_runs,
+    }, config=load_config(config)))
+
+
+@harness_app.command("design")
+def harness_design(
+    task: Annotated[str, typer.Option("--task", help="Task spec JSON / path.")],
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Design an initial harness genome for a task (requires [model])."""
+    _print_result(call_core("harness", "design", {"task": task}, config=load_config(config)))
+
+
+@harness_app.command("benchmark")
+def harness_benchmark(
+    task: Annotated[str, typer.Option("--task", help="Task spec JSON / path.")],
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Build a frozen harness benchmark suite (requires [model])."""
+    _print_result(call_core("harness", "benchmark", {"task": task}, config=load_config(config)))
+
+
+@harness_app.command("evaluate")
+def harness_evaluate(
+    genome: Annotated[str, typer.Option("--genome", help="Genome JSON / path.")],
+    benchmark: Annotated[str | None, typer.Option("--benchmark", help="Benchmark path or cases JSON.")] = None,
+    repeated_runs: Annotated[int, typer.Option("--repeated-runs")] = 3,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Evaluate a genome against a benchmark with the deterministic executor."""
+    _print_result(call_core("harness", "evaluate", {"genome": genome, "benchmark": benchmark, "repeated_runs": repeated_runs}, config=load_config(config)))
+
+
+@harness_app.command("failures")
+def harness_failures(
+    genome: Annotated[str, typer.Option("--genome", help="Genome JSON / path.")],
+    evaluation: Annotated[str, typer.Option("--evaluation", help="Evaluation JSON / path.")] = "{}",
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Classify earliest-causal failures (requires [model])."""
+    _print_result(call_core("harness", "failures", {"genome": genome, "evaluation": evaluation}, config=load_config(config)))
+
+
+@harness_app.command("mutate")
+def harness_mutate(
+    incumbent: Annotated[str, typer.Option("--incumbent", help="Incumbent genome JSON / path.")],
+    number_of_candidates: Annotated[int, typer.Option("--number-of-candidates")] = 8,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Propose targeted harness mutations (requires [model])."""
+    _print_result(call_core("harness", "mutate", {"incumbent": incumbent, "number_of_candidates": number_of_candidates}, config=load_config(config)))
+
+
+@harness_app.command("judge")
+def harness_judge(
+    incumbent_eval: Annotated[str, typer.Option("--incumbent-eval", help="Incumbent evaluation JSON / path.")],
+    challenger_eval: Annotated[str, typer.Option("--challenger-eval", help="Challenger evaluation JSON / path.")],
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Run the qualitative experiment judge (requires [model])."""
+    _print_result(call_core("harness", "judge", {"incumbent_eval": incumbent_eval, "challenger_eval": challenger_eval}, config=load_config(config)))
+
+
+@harness_app.command("lineage")
+def harness_lineage(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
+    """List harness lineage records."""
+    _print_result(call_core("harness", "lineage", {}, config=load_config(config)))
+
+
+@harness_app.command("incumbent")
+def harness_incumbent(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
+    """Show the current incumbent harness genome."""
+    _print_result(call_core("harness", "incumbent", {}, config=load_config(config)))
+
+
+@harness_app.command("training-records")
+def harness_training_records(config: Annotated[Path | None, typer.Option("--config")] = None) -> None:
+    """List emitted harness training records."""
+    _print_result(call_core("harness", "training_records", {}, config=load_config(config)))
 
 
 def main() -> None:
