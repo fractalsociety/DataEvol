@@ -1,0 +1,63 @@
+{
+  "schema": "dataevol.reusable_lora_socket_published_result.v1",
+  "verdict": "REJECTED",
+  "model": {
+    "id": "mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit",
+    "revision": "01a708812690b4685ab18e3b0a27848f92c50746",
+    "weight_sha256": "5e84abc79956b48bb6e4a6c319bb6313aa6c0cbab34288e9f50d063854c486a6"
+  },
+  "confirmed_socket": {
+    "socket_id": "candidate-08",
+    "trainable_parameters": 2390528,
+    "rank": 58,
+    "placements": {
+      "2": ["o_proj"],
+      "7": ["q_proj", "v_proj"],
+      "9": ["down_proj"],
+      "12": ["down_proj"],
+      "17": ["down_proj"],
+      "19": ["down_proj"]
+    }
+  },
+  "four_bit_json_complete_record_accuracy": {
+    "best_single": {"mean": 1.0, "population_std": 0.0},
+    "best_sampled_random": {"mean": 0.998, "population_std": 0.0028284271247461922},
+    "universal": {"mean": 0.996, "population_std": 0.005656854249492385},
+    "json_specific": {"mean": 0.982, "population_std": 0.019866219234335136},
+    "uniform": {"mean": 0.97, "population_std": 0.04102032016777374}
+  },
+  "discovery_behavior": {
+    "arithmetic_exact_accuracy": 0.012,
+    "python_restricted_unit_test_pass_rate": 0.0
+  },
+  "eight_bit_seed_17_json_complete_record_accuracy": {
+    "universal": 1.0,
+    "uniform": 0.956,
+    "best_single": 1.0
+  },
+  "execution": {
+    "training_jobs": 86,
+    "optimizer_updates": 26600,
+    "recorded_training_hours": 1.526108985765863,
+    "max_peak_memory_bytes": 1634130564,
+    "search_break_even_experts": 5
+  },
+  "artifact_hashes": {
+    "confirmed_experiment": "e0c0792c9d4d95839fd2a1ab9c4c5d76238974d61865fbada9d46459560388c6",
+    "discovery_confirmation": "bfc9cec1cf0e1c931089bc31611c927b0c68f9275db348bedb839c17f21b69e0",
+    "discovery_behavior": "74efa3625e888d7bb64022382c8e337cd61c87845a226b4d2400b2ff781a5b53",
+    "precision_check": "b3258c04a4d012a1b15db88cf4c3fb58c69789e09cc6ea22689f73c119e27d8e",
+    "adjudication": "9f77ff0c5a387648637efa73c877a44ffa82c6f9067193104435088dd960b0ce"
+  },
+  "scope": {
+    "proxy_candidates": 12,
+    "final_seeds": 3,
+    "final_steps": 500,
+    "eight_bit_seeds": 1,
+    "limitations": [
+      "JSON evaluation has a ceiling effect",
+      "discovery candidates were ranked by validation loss rather than behavioral accuracy",
+      "the full 24-candidate and 1500-step study was not run"
+    ]
+  }
+}
