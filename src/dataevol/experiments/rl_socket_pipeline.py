@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import fcntl
 import hashlib
@@ -9,11 +10,12 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -30,7 +32,7 @@ from dataevol.experiments.reusable_lora_socket import (
     TrainConfig,
     _apply_socket,
     _arithmetic_correct,
-    _python_unit_test_pass,
+    _extract_python,
     create_socket,
     generate_socket_candidates,
     parameter_matched_random,
@@ -208,6 +210,74 @@ def run_pipeline(config_path: str | Path, run_dir: str | Path, *, resume: bool) 
         return result
 
 
+def run_two_seed_test(config_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
+    config_path = Path(config_path)
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    audit = _read_json(root / "trainer_audit.json")
+    if audit["verdict"] != "ELIGIBLE" or audit["git_commit"] != _git_commit():
+        raise RuntimeError("two-seed test requires an ELIGIBLE audit for the current Git commit")
+    config = _read_json(config_path)
+    _validate_config(config)
+    prepare_datasets(root / "datasets")
+    manifest = build_candidate_manifest(config, root)
+    frozen = _evaluate_frozen_base(config, root)
+    candidate = next(row for row in manifest["candidates"] if row["socket_id"] == "guided-00")
+    results = [
+        _run_candidate_subprocess(
+            config_path,
+            root,
+            candidate,
+            int(seed),
+            100,
+            "two-seed-test",
+            method="guided_socket_v2_1",
+        )
+        for seed in config["search"]["seeds"]
+    ]
+    summaries = []
+    for result in results:
+        summaries.append({
+            "seed": result["seed"],
+            "updates": result["updates"],
+            "aborted_early": result["aborted_early"],
+            "abort_reason": result["abort_reason"],
+            "behavioral_accuracy": result["behavioral_accuracy"],
+            "behavioral_improvement": result["behavioral_improvement"],
+            "true_correct_groups": int(sum(row["pass_at_group_size"] for row in result["health_tail"])),
+            "zero_variance_group_fraction": result["zero_variance_group_fraction"],
+            "completion_diversity": result["completion_diversity"],
+            "kl_divergence": result["kl_divergence"],
+            "clip_fraction": result["clip_fraction"],
+            "unhealthy": result["unhealthy"],
+            "generated_tokens": result["generated_tokens"],
+            "wall_clock_seconds": result["wall_clock_seconds"],
+            "result_hash": result["result_hash"],
+        })
+    healthy = all(not row["unhealthy"] and not row["aborted_early"] for row in summaries)
+    behavioral_signal = all(row["true_correct_groups"] > 0 for row in summaries)
+    final_gain = float(np.mean([row["behavioral_improvement"] for row in summaries])) > 0
+    if healthy and behavioral_signal and final_gain:
+        verdict = "ELIGIBLE_FOR_SEARCH"
+    elif healthy:
+        verdict = "STABLE_BUT_NO_VERIFIED_GAIN"
+    else:
+        verdict = "REJECTED"
+    body = {
+        "schema": f"{SCHEMA}.two_seed_test.v1",
+        "audit_hash": audit["audit_hash"],
+        "candidate": candidate,
+        "frozen_valid_behavioral_accuracy": frozen["valid"]["behavioral_accuracy"],
+        "results": summaries,
+        "verdict": verdict,
+        "completed_at": utc_now(),
+    }
+    report = {**body, "test_hash": _hash(body)}
+    _write_atomic_json(root / "two_seed_result.json", report)
+    _write_atomic_json(root / "latest_result.json", report)
+    return report
+
+
 def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     global TERMINATE_REQUESTED
     job = _read_json(Path(job_path))
@@ -225,9 +295,19 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     from mlx_lm import load
 
     model, tokenizer = load(job["model_path"])
-    _apply_socket(model, job["candidate"])
+    _apply_socket(
+        model,
+        job["candidate"],
+        scale=float(job["adapter_contract"]["lora_scale"]),
+        dropout=float(job["adapter_contract"]["dropout"]),
+    )
     reference, _ = load(job["model_path"])
-    _apply_socket(reference, job["candidate"])
+    _apply_socket(
+        reference,
+        job["candidate"],
+        scale=float(job["adapter_contract"]["lora_scale"]),
+        dropout=float(job["adapter_contract"]["dropout"]),
+    )
     starting_adapter = job.get("starting_adapter")
     if starting_adapter:
         weights = list(mx.load(starting_adapter).items())
@@ -249,6 +329,8 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     reward_history: list[float] = []
     health_history: list[dict[str, Any]] = []
     generated_tokens = 0
+    current_beta = ppo_config.beta
+    abort_reason: str | None = None
     latest = _latest_checkpoint(candidate_dir / "checkpoints")
     if latest:
         loaded = load_checkpoint(latest, model=model, optimizer=optimizer, sampler=sampler)
@@ -257,6 +339,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         reward_history = list(state["reward_history"])
         health_history = list(state["health_history"])
         generated_tokens = int(state["generated_tokens"])
+        current_beta = float(state.get("current_beta", current_beta))
     data_root = root / "datasets"
     datasets = {
         task: _read_jsonl(data_root / task / "train.jsonl")
@@ -294,20 +377,28 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         )
         before = {name: mx.array(value) for name, value in tree_flatten(model.trainable_parameters())}
 
-        def objective() -> tuple[mx.array, dict[str, mx.array]]:
-            return ppo_loss(model(tokens), batch, ppo_config)
+        epoch_gradient_norms = []
+        for _ in range(int(job.get("ppo_epochs", 1))):
+            runtime_ppo = replace(ppo_config, beta=current_beta)
 
-        loss_and_grad = nn.value_and_grad(model, objective)
-        (loss, metrics), gradients = loss_and_grad()
-        mx.eval(loss, *metrics.values(), *[value for _, value in tree_flatten(gradients)], *before.values())
-        gradients, gradient_norm = clip_gradients(gradients, ppo_config.max_grad_norm)
-        finite = all(bool(mx.all(mx.isfinite(value))) for _, value in tree_flatten(gradients))
-        if not finite:
-            health_history.append({"update": update, "unhealthy": True, "reason": "non-finite gradient"})
-            _checkpoint_job(candidate_dir, job, model, optimizer, sampler, update, reward_history, health_history, generated_tokens)
-            raise FloatingPointError("non-finite gradient")
-        optimizer.update(model, gradients)
-        mx.eval(model.parameters(), optimizer.state, loss, *metrics.values(), gradient_norm)
+            def objective() -> tuple[mx.array, dict[str, mx.array]]:
+                return ppo_loss(model(tokens), batch, runtime_ppo)
+
+            loss_and_grad = nn.value_and_grad(model, objective)
+            (loss, metrics), gradients = loss_and_grad()
+            mx.eval(loss, *metrics.values(), *[value for _, value in tree_flatten(gradients)], *before.values())
+            gradients, gradient_norm = clip_gradients(gradients, ppo_config.max_grad_norm)
+            finite = all(bool(mx.all(mx.isfinite(value))) for _, value in tree_flatten(gradients))
+            if not finite:
+                health_history.append({"update": update, "unhealthy": True, "reason": "non-finite gradient"})
+                _checkpoint_job(
+                    candidate_dir, job, model, optimizer, sampler, update,
+                    reward_history, health_history, generated_tokens, current_beta,
+                )
+                raise FloatingPointError("non-finite gradient")
+            optimizer.update(model, gradients)
+            mx.eval(model.parameters(), optimizer.state, loss, *metrics.values(), gradient_norm)
+            epoch_gradient_norms.append(float(gradient_norm))
         update_norm = math.sqrt(sum(float(mx.sum((value - before[name]) ** 2)) for name, value in tree_flatten(model.trainable_parameters())))
         entropy = _policy_entropy(model(tokens), batch)
         reward_array = np.asarray(rewards, dtype=float)
@@ -327,17 +418,40 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             "policy_entropy": entropy,
             "kl_divergence": float(metrics["kl"]),
             "clip_fraction": float(metrics["clip_fraction"]),
-            "gradient_norm": float(gradient_norm),
+            "gradient_norm": float(np.mean(epoch_gradient_norms)),
             "adapter_update_norm": update_norm,
             "loss": float(loss),
             "hard_limit_fraction": float(np.mean([len(item) >= int(job["rollout"]["max_completion_tokens"]) for item in completions])),
             "peak_memory_bytes": int(mx.get_peak_memory()),
+            "kl_beta": current_beta,
         }
+        if health["kl_divergence"] > float(job["health"]["kl_threshold"]):
+            current_beta = min(
+                float(job["health"].get("kl_beta_max", 2.0)),
+                current_beta * float(job["health"].get("kl_beta_growth", 2.0)),
+            )
+        elif health["kl_divergence"] < float(job["health"]["kl_threshold"]) / 2:
+            current_beta = max(
+                ppo_config.beta,
+                current_beta / float(job["health"].get("kl_beta_growth", 2.0)),
+            )
+        health["next_kl_beta"] = current_beta
         health["unhealthy"] = _is_unhealthy(health, job["health"])
         health_history.append(health)
         update += 1
+        abort_reason = _health_abort_reason(health_history, job["health"])
         if update % int(job["checkpoint_every"]) == 0 or update == int(job["target_update"]) or TERMINATE_REQUESTED:
-            _checkpoint_job(candidate_dir, job, model, optimizer, sampler, update, reward_history, health_history, generated_tokens)
+            _checkpoint_job(
+                candidate_dir, job, model, optimizer, sampler, update,
+                reward_history, health_history, generated_tokens, current_beta,
+            )
+        if abort_reason:
+            if update % int(job["checkpoint_every"]) != 0:
+                _checkpoint_job(
+                    candidate_dir, job, model, optimizer, sampler, update,
+                    reward_history, health_history, generated_tokens, current_beta,
+                )
+            break
         if TERMINATE_REQUESTED:
             raise SystemExit(128 + signal.SIGTERM)
     behavior = _evaluate_candidate(
@@ -348,6 +462,9 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         split=str(job["evaluation"]["split"]),
     )
     summary = _summarize_job(job, health_history, reward_history, generated_tokens, behavior, time.perf_counter() - started)
+    summary["aborted_early"] = abort_reason is not None
+    summary["abort_reason"] = abort_reason
+    summary["unhealthy"] = bool(summary["unhealthy"] or abort_reason)
     prior = [_read_json(path) for path in sorted(candidate_dir.glob("metrics-*.json"))]
     curve = sorted(
         [{"generated_tokens": row["generated_tokens"], "behavioral_accuracy": row["behavioral_accuracy"]} for row in prior]
@@ -400,6 +517,7 @@ def _run_candidate_subprocess(
         "selection": config["selection"],
         "health": config["health"],
         "ppo": {**config["ppo"], **({"learning_rate": 0.0} if method == "zero_learning_rate_control" else {})},
+        "ppo_epochs": config.get("ppo_epochs", 1),
         "optimizer": config["optimizer"],
         "checkpoint_every": config["checkpoint_every"],
         "adapter_contract": config["adapter"],
@@ -838,10 +956,90 @@ def _pad_rollouts(prompt: Sequence[int], completions: Sequence[Sequence[int]], p
 
 
 def _training_reward(task: str, output: str, row: Mapping[str, Any], length: int, hard_limit: int) -> float:
-    correct = _arithmetic_correct(output, row["answer"]) if task == "arithmetic" else _python_unit_test_pass(output, row["completion"])
-    format_bonus = 0.02 if (task == "arithmetic" and output.strip().lstrip("-").isdigit()) or (task == "python" and "def " in output) else 0.0
-    length_bonus = 0.01 * max(0.0, 1.0 - length / max(1, hard_limit))
-    return float(correct) + min(0.02, format_bonus) + min(0.01, length_bonus)
+    behavioral = (
+        _arithmetic_behavioral_reward(output, row["answer"])
+        if task == "arithmetic"
+        else _python_public_test_fraction(output, row["completion"])
+    )
+    if behavioral <= 0:
+        return 0.0
+    format_bonus = 0.01 if (task == "arithmetic" and output.strip().lstrip("-").isdigit()) or (task == "python" and "def " in output) else 0.0
+    length_bonus = 0.005 * max(0.0, 1.0 - length / max(1, hard_limit))
+    return behavioral + min(0.01, format_bonus) + min(0.005, length_bonus)
+
+
+def _arithmetic_behavioral_reward(output: str, expected: str) -> float:
+    match = re.search(r"(?<![\d.])-?\d+(?![\d.])", output.strip())
+    if not match:
+        return 0.0
+    observed = int(match.group(0))
+    target = int(expected)
+    if observed == target:
+        return 1.0
+    relative_error = abs(observed - target) / max(1.0, abs(target))
+    return 0.25 * math.exp(-4.0 * relative_error)
+
+
+def _python_public_test_fraction(output: str, expected: str, *, hidden: bool = False) -> float:
+    code = _extract_python(output)
+    try:
+        tree = ast.parse(code)
+        expected_tree = ast.parse(expected)
+    except SyntaxError:
+        return 0.0
+    allowed = (
+        ast.Module, ast.FunctionDef, ast.arguments, ast.arg, ast.Return, ast.Name,
+        ast.Load, ast.BinOp, ast.Add, ast.Sub, ast.Mult, ast.Mod, ast.Subscript,
+        ast.Constant, ast.UnaryOp, ast.USub, ast.Call, ast.Compare, ast.Eq,
+        ast.In, ast.NotIn,
+    )
+    if any(not isinstance(node, allowed) for node in ast.walk(tree)):
+        return 0.0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and (not isinstance(node.func, ast.Name) or node.func.id not in {"min", "max"}):
+            return 0.0
+    expected_functions = [node.name for node in expected_tree.body if isinstance(node, ast.FunctionDef)]
+    candidate_functions = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
+    if len(expected_functions) != 1 or candidate_functions != expected_functions:
+        return 0.0
+    function = expected_functions[0]
+    public_cases = {
+        "clamp": [((5, 0, 3), 3), ((-2, 0, 3), 0), ((2, 0, 3), 2)],
+        "is_even": [((4,), True), ((3,), False), ((0,), True)],
+        "last_item": [(([1, 2, 3],), 3), ((["x"],), "x"), (([-1, 7],), 7)],
+        "add_tax": [((100, 0.1), 110.0), ((20, 0.0), 20.0), ((50, 0.2), 60.0)],
+        "contains": [(([1, 2], 2), True), (([1, 2], 3), False), (([], 1), False)],
+        "square": [((3,), 9), ((-4,), 16), ((0,), 0)],
+        "first_item": [(([4, 5, 6],), 4), ((["x"],), "x"), (([-2, 8],), -2)],
+        "subtract": [((5, 2), 3), ((-1, 4), -5), ((0, -3), 3)],
+    }
+    cases = public_cases.get(function)
+    if cases is None:
+        return 0.0
+    selected = cases[1:] if hidden else cases[:2]
+    assertions = "\n".join(
+        f"\ntry:\n    passed += int({function}(*{args!r}) == {value!r})\nexcept Exception:\n    pass"
+        for args, value in selected
+    )
+    program = f"{code}\npassed = 0\n{assertions}\nprint(passed)\n"
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", program],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=1.0,
+            check=False,
+            text=True,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return 0.0
+    try:
+        passed = int(result.stdout.strip()) if result.returncode == 0 else 0
+    except ValueError:
+        return 0.0
+    return passed / len(selected)
 
 
 def _evaluate_candidate(model: nn.Module, tokenizer: Any, data_root: Path, *, limit: int, split: str) -> dict[str, Any]:
@@ -854,7 +1052,9 @@ def _evaluate_candidate(model: nn.Module, tokenizer: Any, data_root: Path, *, li
         prompts = [_prompt_tokens(tokenizer, row["prompt"]) for row in rows]
         response = batch_generate(model, tokenizer, prompts, max_tokens=64, sampler=make_sampler(temp=0.0), verbose=False)
         outcomes = [
-            _arithmetic_correct(output, row["answer"]) if task == "arithmetic" else _python_unit_test_pass(output, row["completion"])
+            _arithmetic_correct(output, row["answer"])
+            if task == "arithmetic"
+            else _python_public_test_fraction(output, row["completion"], hidden=True) == 1.0
             for output, row in zip(response.texts, rows)
         ]
         result[task] = {"accuracy": float(np.mean(outcomes)), "outcomes": outcomes, "rows": len(rows)}
@@ -885,7 +1085,8 @@ def _summarize_job(job: Mapping[str, Any], health: Sequence[Mapping[str, Any]], 
         "arm": job["candidate"]["arm"],
         "method": job["method"],
         "seed": job["seed"],
-        "updates": job["target_update"],
+        "updates": int(health[-1]["update"]) if health else 0,
+        "target_updates": job["target_update"],
         "generated_tokens": generated_tokens,
         "mean_task_reward": mean_reward,
         "reward_per_1000_generated_tokens": reward_per_1k,
@@ -915,7 +1116,18 @@ def _summarize_job(job: Mapping[str, Any], health: Sequence[Mapping[str, Any]], 
     return {**body, "result_hash": _hash(body)}
 
 
-def _checkpoint_job(candidate_dir: Path, job: Mapping[str, Any], model: nn.Module, optimizer: optim.Optimizer, sampler: StatefulSampler, update: int, rewards: Sequence[float], health: Sequence[Mapping[str, Any]], generated_tokens: int) -> Path:
+def _checkpoint_job(
+    candidate_dir: Path,
+    job: Mapping[str, Any],
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    sampler: StatefulSampler,
+    update: int,
+    rewards: Sequence[float],
+    health: Sequence[Mapping[str, Any]],
+    generated_tokens: int,
+    current_beta: float,
+) -> Path:
     config_lock = {
         "model": job["model_path"],
         "socket_hash": job["candidate"]["socket_hash"],
@@ -933,7 +1145,13 @@ def _checkpoint_job(candidate_dir: Path, job: Mapping[str, Any], model: nn.Modul
         gradient_accumulator={},
         sampler=sampler,
         scheduler_state={"update": update, "learning_rate": job["ppo"]["learning_rate"]},
-        training_state={"update": update, "reward_history": list(rewards), "health_history": list(health), "generated_tokens": generated_tokens},
+        training_state={
+            "update": update,
+            "reward_history": list(rewards),
+            "health_history": list(health),
+            "generated_tokens": generated_tokens,
+            "current_beta": current_beta,
+        },
         config=config_lock,
     )
 
@@ -946,11 +1164,32 @@ def _policy_entropy(logits: mx.array, batch: Any) -> float:
 
 
 def _is_unhealthy(metrics: Mapping[str, Any], health: Mapping[str, Any]) -> bool:
-    return bool(
-        metrics["kl_divergence"] > float(health["kl_threshold"])
-        or metrics["hard_limit_fraction"] > float(health["hard_limit_fraction_threshold"])
-        or not math.isfinite(metrics["gradient_norm"])
-    )
+    return not math.isfinite(metrics["gradient_norm"])
+
+
+def _health_abort_reason(history: Sequence[Mapping[str, Any]], health: Mapping[str, Any]) -> str | None:
+    kl_window = int(health.get("kl_abort_consecutive", 3))
+    if len(history) >= kl_window and all(
+        row["kl_divergence"] > float(health["kl_threshold"])
+        for row in history[-kl_window:]
+    ):
+        return f"KL exceeded {health['kl_threshold']} for {kl_window} consecutive updates"
+    variance_window = int(health.get("zero_variance_window", 20))
+    if len(history) >= variance_window and np.mean(
+        [row["zero_variance_group"] for row in history[-variance_window:]]
+    ) > float(health.get("zero_variance_abort_threshold", 0.90)):
+        return "sustained zero-variance rollout groups"
+    diversity_window = int(health.get("diversity_window", 10))
+    if len(history) >= diversity_window and np.mean(
+        [row["completion_diversity"] for row in history[-diversity_window:]]
+    ) < float(health.get("diversity_abort_threshold", 0.20)):
+        return "sustained completion-diversity collapse"
+    hard_limit_window = int(health.get("hard_limit_window", 5))
+    if len(history) >= hard_limit_window and np.mean(
+        [row["hard_limit_fraction"] for row in history[-hard_limit_window:]]
+    ) > float(health["hard_limit_fraction_threshold"]):
+        return "completion length repeatedly reached the hard limit"
+    return None
 
 
 def _mechanistic_socket(identifier: str, family: str, target: int) -> dict[str, Any]:
@@ -1184,6 +1423,9 @@ def main() -> None:
     pipeline.add_argument("--config", required=True, type=Path)
     pipeline.add_argument("--run", required=True, type=Path)
     pipeline.add_argument("--resume", action="store_true")
+    two_seed = subparsers.add_parser("two-seed-test")
+    two_seed.add_argument("--config", required=True, type=Path)
+    two_seed.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -1191,6 +1433,8 @@ def main() -> None:
         result = run_correctness_audit(args.run, args.config)
     elif args.command == "worker":
         result = train_candidate_job(args.job)
+    elif args.command == "two-seed-test":
+        result = run_two_seed_test(args.config, args.run)
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))

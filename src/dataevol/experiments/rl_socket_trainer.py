@@ -203,9 +203,9 @@ def make_rollout_batch(
     reference_logits = reference(tokens)
     old_logprobs, _ = completion_logprobs(policy_logits, tokens, prompt_lengths, completion_lengths)
     reference_logprobs, _ = completion_logprobs(reference_logits, tokens, prompt_lengths, completion_lengths)
-    centered = rewards - mx.mean(rewards)
-    scale = mx.std(rewards)
-    advantages = mx.where(scale > 1e-8, centered / (scale + 1e-8), centered)
+    # Preserve the magnitude of bounded shaping rewards. Variance normalization
+    # would turn tiny shaping-only differences into unit-scale policy updates.
+    advantages = rewards - mx.mean(rewards)
     mx.eval(policy_logits, reference_logits, old_logprobs, reference_logprobs, advantages)
     return RolloutBatch(
         tokens=tokens,

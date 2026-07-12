@@ -84,6 +84,21 @@ def test_old_policy_and_reference_policy_are_separate() -> None:
     assert not np.allclose(np.asarray(ratio), 1.0)
 
 
+def test_small_shaping_rewards_keep_small_advantages() -> None:
+    mx.random.seed(91)
+    policy = ToyCausalPolicy()
+    reference = clone_frozen(policy)
+    batch = make_rollout_batch(
+        policy,
+        reference,
+        mx.array([[1, 2, 6], [1, 2, 7]], dtype=mx.int32),
+        mx.array([2, 2]),
+        mx.array([1, 1]),
+        mx.array([0.0, 0.01]),
+    )
+    assert np.allclose(np.asarray(batch.advantages), [-0.005, 0.005], atol=1e-7)
+
+
 def test_kl_responds_to_policy_change_and_beta() -> None:
     mx.random.seed(10)
     policy = ToyCausalPolicy()

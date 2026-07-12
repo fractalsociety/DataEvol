@@ -1,0 +1,86 @@
+{
+  "schema": "dataevol.rl_socket_v2.config.v1",
+  "run_id": "rl-socket-v2.1-two-seed",
+  "model": {
+    "id": "mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit",
+    "path": ".dataevol/models/tinyllama-1.1b-chat-4bit",
+    "revision": "01a708812690b4685ab18e3b0a27848f92c50746",
+    "tokenizer_revision": "01a708812690b4685ab18e3b0a27848f92c50746",
+    "quantization": "4-bit group-64 MLX QLoRA base"
+  },
+  "sft_source_experiment": ".dataevol/experiments/reusable_socket_mvp_v3",
+  "sft_adapter_path": ".dataevol/experiments/reusable_socket_mvp_v3/discovery_confirmation/candidate-08/seed-17/arithmetic/adapters.safetensors",
+  "adapter": {
+    "target_parameters": 2400000,
+    "maximum_parameter_mismatch": 0.005,
+    "nominal_rank_budget": "candidate-specific ranks targeting 2.4M exact parameters",
+    "lora_scale": 1.0,
+    "alpha_policy": "alpha = rank for each entry",
+    "alpha_rank_ratio": 1.0,
+    "dropout": 0.0,
+    "initialization": "lora_a uniform [-1/sqrt(input_dim), +1/sqrt(input_dim)]; lora_b zeros"
+  },
+  "search": {
+    "candidates_per_arm": 8,
+    "random_seed": 92017,
+    "seeds": [17, 29],
+    "promotion_margin": 0.02,
+    "cumulative_updates": [100]
+  },
+  "rollout": {
+    "group_size": 8,
+    "temperature": 0.9,
+    "max_completion_tokens": 48
+  },
+  "evaluation": {
+    "limit": 128,
+    "discovery_prompts_are_disjoint_from_training": true,
+    "python_hidden_tests": true
+  },
+  "selection": {
+    "arithmetic_weight": 0.45,
+    "python_weight": 0.35,
+    "behavioral_improvement_efficiency_weight": 0.10,
+    "retention_weight": 0.05,
+    "seed_stability_weight": 0.05,
+    "efficiency_scale": 0.02
+  },
+  "ppo": {
+    "clip_epsilon": 0.2,
+    "beta": 0.1,
+    "learning_rate": 0.00005,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0,
+    "kl_numerical_floor": 0.001
+  },
+  "ppo_epochs": 2,
+  "optimizer": {
+    "name": "AdamW",
+    "betas": [0.9, 0.999],
+    "eps": 1e-8
+  },
+  "health": {
+    "zero_variance_group_threshold": 0.70,
+    "zero_variance_window": 20,
+    "zero_variance_abort_threshold": 0.90,
+    "diversity_window": 10,
+    "diversity_abort_threshold": 0.20,
+    "kl_threshold": 0.20,
+    "kl_abort_consecutive": 3,
+    "kl_beta_growth": 2.0,
+    "kl_beta_max": 2.0,
+    "hard_limit_window": 5,
+    "hard_limit_fraction_threshold": 0.75
+  },
+  "confirmation": {
+    "seeds": [17, 29],
+    "automatic_extra_seeds": [],
+    "updates": 100,
+    "noninferiority_margin": 0.02,
+    "bootstrap_draws": 10000
+  },
+  "checkpoint_every": 25,
+  "single_candidate_concurrency": 1,
+  "post_training_precision_evaluation": ["4-bit"],
+  "qat": false
+}

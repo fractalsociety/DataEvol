@@ -864,7 +864,13 @@ def _summarize(results: list[dict[str, Any]], frozen: Mapping[str, Any], discove
     }
 
 
-def _apply_socket(model: Any, socket: Mapping[str, Any]) -> None:
+def _apply_socket(
+    model: Any,
+    socket: Mapping[str, Any],
+    *,
+    scale: float = 20.0,
+    dropout: float = 0.0,
+) -> None:
     from mlx.utils import tree_unflatten
     from mlx_lm.tuner.lora import LoRALinear
 
@@ -878,7 +884,17 @@ def _apply_socket(model: Any, socket: Mapping[str, Any]) -> None:
             base = modules.get(key)
             if base is None:
                 raise ValueError(f"TinyLlama layer lacks socket module {key}")
-            replacements.append((key, LoRALinear.from_base(base, r=int(entry["rank"]), scale=20.0, dropout=0.0)))
+            replacements.append(
+                (
+                    key,
+                    LoRALinear.from_base(
+                        base,
+                        r=int(entry["rank"]),
+                        scale=scale,
+                        dropout=dropout,
+                    ),
+                )
+            )
         layer.update_modules(tree_unflatten(replacements))
 
 

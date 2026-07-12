@@ -5,8 +5,12 @@ import json
 from dataevol.experiments.reusable_lora_socket import generate_socket_candidates
 from dataevol.experiments.rl_socket_pipeline import (
     FAMILIES,
+    _arithmetic_behavioral_reward,
     _contiguous_socket,
+    _health_abort_reason,
     _mechanistic_socket,
+    _python_public_test_fraction,
+    _training_reward,
     _validate_config,
     build_candidate_manifest,
 )
@@ -73,3 +77,46 @@ def test_config_rejects_small_groups_and_loose_parameter_matching() -> None:
         assert "at least eight" in str(error)
     else:
         raise AssertionError("undersized rollout group was accepted")
+
+
+def test_training_rewards_are_behavioral_and_shaping_is_gated() -> None:
+    assert _arithmetic_behavioral_reward("42", "42") == 1.0
+    assert _arithmetic_behavioral_reward("40", "42") > _arithmetic_behavioral_reward("4", "42") > 0.0
+    assert _training_reward("arithmetic", "no number", {"answer": "42"}, 2, 48) == 0.0
+
+    expected = "def subtract(a, b):\n    return a - b"
+    correct = "def subtract(a, b):\n    return a - b"
+    partial = "def subtract(a, b):\n    return 3"
+    assert _python_public_test_fraction(correct, expected) == 1.0
+    assert _python_public_test_fraction(partial, expected) == 0.5
+    assert _training_reward("python", "not python", {"completion": expected}, 2, 48) == 0.0
+
+
+def test_every_python_training_function_has_public_behavior_tests() -> None:
+    functions = [
+        "def clamp(x, low, high):\n    return max(low, min(x, high))",
+        "def is_even(n):\n    return n % 2 == 0",
+        "def last_item(items):\n    return items[-1]",
+        "def add_tax(price, rate):\n    return price + price * rate",
+        "def contains(items, value):\n    return value in items",
+        "def square(n):\n    return n * n",
+    ]
+    assert all(_python_public_test_fraction(code, code) == 1.0 for code in functions)
+
+
+def test_health_abort_requires_sustained_failure() -> None:
+    health = {
+        "kl_threshold": 0.2,
+        "kl_abort_consecutive": 3,
+        "zero_variance_window": 20,
+        "zero_variance_abort_threshold": 0.9,
+        "diversity_window": 10,
+        "diversity_abort_threshold": 0.2,
+    }
+    history = [
+        {"kl_divergence": value, "zero_variance_group": 0.0, "completion_diversity": 1.0}
+        for value in (0.1, 0.3, 0.4)
+    ]
+    assert _health_abort_reason(history, health) is None
+    history.append({"kl_divergence": 0.5, "zero_variance_group": 0.0, "completion_diversity": 1.0})
+    assert _health_abort_reason(history, health).startswith("KL exceeded")

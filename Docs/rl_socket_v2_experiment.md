@@ -39,3 +39,18 @@ echo "$!" >"$RUN/pipeline.pid"
 ```
 
 The pipeline owns the operating-system lock and rejects a duplicate launch even if the PID file is stale.
+
+## v2.1 Two-Seed Repair
+
+The first Stage A attempt was stopped after seeds 17 and 29 both produced zero behavioral accuracy, zero true-correct rollout groups, excessive KL, and completion collapse. The failure was attributed to reward and trainer behavior rather than socket placement.
+
+The two-seed repair in `configs/rl_socket_v2_1_two_seed.yaml`:
+
+- gives arithmetic a bounded error-sensitive behavioral reward;
+- gives Python partial public-unit-test reward across every training function;
+- suppresses format and length shaping when behavioral reward is zero;
+- uses center-only advantages so tiny shaping differences remain tiny;
+- reduces LoRA alpha/rank scale from 20 to 1;
+- uses two PPO epochs so ratio clipping is exercised;
+- adapts KL beta and aborts sustained KL, variance, diversity, or length failures;
+- runs only guided candidate 00 for seeds 17 and 29 before any broader search.
