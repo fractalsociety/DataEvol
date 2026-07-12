@@ -365,6 +365,8 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             temperature=float(job["rollout"]["temperature"]),
             eos_tokens=set(tokenizer.eos_token_ids),
             additional_stop_sequences=stop_sequences,
+            tokenizer=tokenizer,
+            stop_on_first_integer=task == "arithmetic",
         )
         decoded = [tokenizer.decode(tokens) for tokens in completions]
         rewards = [
@@ -926,6 +928,8 @@ def _batch_cached_completions(
     temperature: float,
     eos_tokens: set[int],
     additional_stop_sequences: Sequence[Sequence[int]] = (),
+    tokenizer: Any | None = None,
+    stop_on_first_integer: bool = False,
 ) -> list[list[int]]:
     from mlx_lm.generate import BatchGenerator
 
@@ -946,9 +950,19 @@ def _batch_cached_completions(
     results = {identifier: [] for identifier in identifiers}
     try:
         while responses := generator.next_generated():
+            custom_stops = []
             for response in responses:
                 if response.token is not None:
                     results[response.uid].append(int(response.token))
+                if (
+                    stop_on_first_integer
+                    and tokenizer is not None
+                    and response.finish_reason is None
+                    and re.search(r"(?<![\d.])-?\d+(?![\d.])", tokenizer.decode(results[response.uid]))
+                ):
+                    custom_stops.append(response.uid)
+            if custom_stops:
+                generator.remove(custom_stops)
     finally:
         generator.close()
     fallback = next(iter(eos_tokens))
