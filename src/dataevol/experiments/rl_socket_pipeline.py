@@ -350,17 +350,27 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         task = ("arithmetic", "python")[update % 2]
         row = random.choice(datasets[task])
         prompt_tokens = _prompt_tokens(tokenizer, row["prompt"])
+        task_max_tokens = int(
+            job["rollout"].get("max_completion_tokens_by_task", {}).get(
+                task, job["rollout"]["max_completion_tokens"]
+            )
+        )
+        stop_sequences = [[13]] if task == "arithmetic" else [[13, 13]]
         completions = _batch_cached_completions(
             model,
             prompt_tokens,
             sampler,
             group_size=int(job["rollout"]["group_size"]),
-            max_tokens=int(job["rollout"]["max_completion_tokens"]),
+            max_tokens=task_max_tokens,
             temperature=float(job["rollout"]["temperature"]),
             eos_tokens=set(tokenizer.eos_token_ids),
+            additional_stop_sequences=stop_sequences,
         )
         decoded = [tokenizer.decode(tokens) for tokens in completions]
-        rewards = [_training_reward(task, output, row, len(tokens), int(job["rollout"]["max_completion_tokens"])) for output, tokens in zip(decoded, completions)]
+        rewards = [
+            _training_reward(task, output, row, len(tokens), task_max_tokens)
+            for output, tokens in zip(decoded, completions)
+        ]
         if job.get("shuffle_rewards"):
             reward_rng = random.Random(int(job["seed"]) * 1_000_003 + update)
             reward_rng.shuffle(rewards)
@@ -421,7 +431,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             "gradient_norm": float(np.mean(epoch_gradient_norms)),
             "adapter_update_norm": update_norm,
             "loss": float(loss),
-            "hard_limit_fraction": float(np.mean([len(item) >= int(job["rollout"]["max_completion_tokens"]) for item in completions])),
+            "hard_limit_fraction": float(np.mean([len(item) >= task_max_tokens for item in completions])),
             "peak_memory_bytes": int(mx.get_peak_memory()),
             "kl_beta": current_beta,
         }
@@ -915,6 +925,7 @@ def _batch_cached_completions(
     max_tokens: int,
     temperature: float,
     eos_tokens: set[int],
+    additional_stop_sequences: Sequence[Sequence[int]] = (),
 ) -> list[list[int]]:
     from mlx_lm.generate import BatchGenerator
 
@@ -926,7 +937,7 @@ def _batch_cached_completions(
 
     generator = BatchGenerator(
         model,
-        stop_tokens=[[token] for token in eos_tokens],
+        stop_tokens=[[token] for token in eos_tokens] + [list(sequence) for sequence in additional_stop_sequences],
         sampler=sample,
         completion_batch_size=group_size,
         prefill_batch_size=group_size,

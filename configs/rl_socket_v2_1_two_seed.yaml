@@ -1,6 +1,6 @@
 {
   "schema": "dataevol.rl_socket_v2.config.v1",
-  "run_id": "rl-socket-v2.1-two-seed",
+  "run_id": "rl-socket-v2.1b-two-seed",
   "model": {
     "id": "mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit",
     "path": ".dataevol/models/tinyllama-1.1b-chat-4bit",
@@ -30,7 +30,11 @@
   "rollout": {
     "group_size": 8,
     "temperature": 0.9,
-    "max_completion_tokens": 48
+    "max_completion_tokens": 64,
+    "max_completion_tokens_by_task": {
+      "arithmetic": 16,
+      "python": 64
+    }
   },
   "evaluation": {
     "limit": 128,
