@@ -23,6 +23,7 @@ from dataevol.experiments.rl_socket_pipeline import (
     _mechanistic_socket,
     _assert_placement_parameter_contract,
     _python_public_test_fraction,
+    _scheduled_socket,
     _training_reward,
     _validate_config,
     build_candidate_manifest,
@@ -34,6 +35,8 @@ from dataevol.experiments.rl_socket_pipeline import (
     prepare_placement_confirmation_curriculum,
     prepare_targeted_arithmetic_curriculum,
     prepare_uniform_kl_sweep_curriculum,
+    proxy_true_gap_detected,
+    select_scheduled_socket_entries,
     select_python_protected_entries,
 )
 
@@ -110,6 +113,8 @@ def test_targeted_confirmation_budget_is_pinned_to_sixty_updates() -> None:
     assert config["placement_confirmation"]["updates"] == 60
     assert config["composite_socket"]["updates"] == 60
     assert config["composite_socket"]["required_start_accuracy_band"] == [0.20, 0.60]
+    assert config["dynamic_socket"]["gain_recovery_target"] == 0.95
+    assert config["dynamic_socket"]["reprobe_every_updates"] == 5
     assert config["placement_confirmation"]["schedule"]["learning_rate"] == 5e-6
     assert [row["learning_rate"] for row in config["uniform_kl_sweep"]["schedules"]] == [1e-5, 5e-6, 2e-6]
 
@@ -249,6 +254,75 @@ def test_composite_socket_reports_frozen_and_incremental_budgets() -> None:
     assert composite["incremental_rl_parameters"] == socket["trainable_parameters"]
     assert composite["trainable_parameters"] == 4_799_232
     assert len(composite["entries"]) == len(single["entries"]) + len(socket["entries"])
+
+
+def test_scheduled_socket_has_low_rank_reserve_in_every_depth_band() -> None:
+    source = generate_socket_candidates(count=3, seed=17)[0]
+
+    scheduled = _scheduled_socket(source, "scheduled")
+
+    assert abs(scheduled["trainable_parameters"] - 2_400_000) / 2_400_000 <= 0.005
+    assert scheduled["trainable_parameters"] == 2_388_480
+    assert scheduled["reserve_entries"] == [
+        "layer-0:family-B",
+        "layer-4:family-B",
+        "layer-8:family-B",
+        "layer-12:family-B",
+        "layer-16:family-B",
+        "layer-20:family-B",
+    ]
+
+
+def test_scheduled_socket_selection_enforces_budget_reserve_and_hysteresis() -> None:
+    candidate = {
+        "entries": [
+            {"layer": 0, "family": "B", "rank": 4},
+            {"layer": 2, "family": "A", "rank": 20},
+            {"layer": 3, "family": "C", "rank": 20},
+        ]
+    }
+    reserve = {"layer-0:family-B"}
+    norms = {
+        "layer-0:family-B": 0.1,
+        "layer-2:family-A": 9.0,
+        "layer-3:family-C": 10.0,
+    }
+
+    selected = select_scheduled_socket_entries(
+        candidate,
+        norms,
+        current_entries={"layer-2:family-A"},
+        reserve_entries=reserve,
+        parameter_budget=150_000,
+        hysteresis_ratio=0.8,
+    )
+
+    assert selected == {"layer-0:family-B", "layer-2:family-A"}
+
+
+def test_proxy_true_gap_requires_rising_reward_and_flat_heldout_behavior() -> None:
+    history = [
+        {"mean_task_reward": 0.1 + index * 0.001}
+        for index in range(10)
+    ] + [
+        {
+            "mean_task_reward": 0.2 + index * 0.001,
+            **({"heldout_behavior": {"arithmetic": {"accuracy": 0.5}}} if index == 9 else {}),
+        }
+        for index in range(10)
+    ]
+    current = {
+        "mean_task_reward": 0.3,
+        "heldout_behavior": {"arithmetic": {"accuracy": 0.5}},
+    }
+
+    assert proxy_true_gap_detected(
+        history, current, reward_window=10, minimum_reward_gain=0.01
+    )
+    current["heldout_behavior"]["arithmetic"]["accuracy"] = 0.6
+    assert not proxy_true_gap_detected(
+        history, current, reward_window=10, minimum_reward_gain=0.01
+    )
 
 
 def test_placement_parameter_contract_rejects_old_uniform_budget() -> None:

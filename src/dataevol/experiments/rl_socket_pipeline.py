@@ -860,6 +860,159 @@ def run_composite_socket_test(config_path: str | Path, run_dir: str | Path) -> d
     return report
 
 
+def run_dynamic_socket_test(config_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
+    """Compare scheduled socket routing with static sockets and uniform LoRA."""
+    config_path = Path(config_path)
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    audit = _read_json(root / "trainer_audit.json")
+    if audit["verdict"] != "ELIGIBLE" or audit["git_commit"] != _git_commit():
+        raise RuntimeError("dynamic socket test requires an ELIGIBLE audit for the current Git commit")
+    config = _read_json(config_path)
+    _validate_config(config)
+    experiment = config["dynamic_socket"]
+    single_source = Path(experiment["single_layer_source_run"])
+    socket_source = Path(experiment["socket_source_run"])
+    uniform_source = Path(experiment["uniform_source_run"])
+    direct_reference_root = Path(experiment["direct_reference_run"])
+    prepare_composite_socket_curriculum(root, single_source)
+    frozen = _evaluate_frozen_base(config, root)
+
+    target = int(config["adapter"]["target_parameters"])
+    single = parameter_matched_single(2, target, socket_id="dynamic-single-layer-2")
+    socket_report = _read_json(socket_source / "sft_then_rl_result.json")
+    scheduled = _scheduled_socket(socket_report["candidate"], "scheduled-socket-a")
+    dynamic_candidate = _tag_topology(
+        _compose_sockets("dynamic-layer-2-plus-socket", single, scheduled),
+        arm="dynamic_socket",
+    )
+    static_candidate = _tag_topology(
+        _compose_sockets("static-layer-2-plus-socket", single, scheduled),
+        arm="dynamic_socket",
+    )
+    uniform = _tag_topology(parameter_matched_uniform(target), arm="dynamic_socket")
+    single_adapter = single_source / "topology_sft/single-2/adapters.safetensors"
+    uniform_adapter = uniform_source / "topology_sft/uniform-exact/adapters.safetensors"
+    baselines = {
+        "dynamic_scheduled_socket": _evaluate_adapter_stack(
+            config, root, dynamic_candidate, [single_adapter]
+        ),
+        "static_socket": _evaluate_adapter_stack(config, root, static_candidate, [single_adapter]),
+        "uniform_direct_rl": _evaluate_adapter(config, root, uniform, uniform_adapter),
+    }
+    if (
+        baselines["dynamic_scheduled_socket"]["test"]["arithmetic"]["outcomes"]
+        != baselines["static_socket"]["test"]["arithmetic"]["outcomes"]
+    ):
+        raise RuntimeError("dynamic and static sockets do not share the same initial policy")
+
+    direct_results = [
+        _read_json(direct_reference_root / f"jobs/composite-single-layer-2/seed-{seed}/latest_result.json")
+        for seed in experiment["seeds"]
+    ]
+    direct_baseline = _read_json(direct_reference_root / "composite_socket_result.json")["paths"][
+        "single_layer_direct_rl"
+    ]["sft_arithmetic_accuracy"]
+    if direct_results[0]["behavior"]["arithmetic"]["outcomes"] == []:
+        raise RuntimeError("direct layer reference lacks prompt-level outcomes")
+    if abs(
+        float(baselines["dynamic_scheduled_socket"]["test"]["arithmetic"]["accuracy"])
+        - float(direct_baseline)
+    ) > 1e-12:
+        raise RuntimeError("dynamic socket panel does not match the direct-layer reference panel")
+
+    schedule = experiment["schedule"]
+    ppo = {
+        **config["ppo"],
+        "learning_rate": float(schedule["learning_rate"]),
+        "beta": float(schedule["beta"]),
+        "max_grad_norm": float(schedule["max_grad_norm"]),
+    }
+    health = {**config["health"], "kl_beta_max": float(schedule["kl_beta_max"])}
+    reserve_entries = list(scheduled["reserve_entries"])
+    scheduled_entries = [entry_key(entry) for entry in scheduled["entries"]]
+    frozen_single_entries = [entry_key(entry) for entry in single["entries"]]
+    dynamic_contract = {
+        "phase": str(experiment["phase"]),
+        "initial_active_entries": scheduled_entries,
+        "reserve_entries": reserve_entries,
+        "reprobe_every_updates": int(experiment["reprobe_every_updates"]),
+        "probe_window_updates": int(experiment["probe_window_updates"]),
+        "hysteresis_ratio": float(experiment["hysteresis_ratio"]),
+        "initial_parameter_budget": int(experiment["initial_parameter_budget"]),
+        "maximum_parameter_budget": int(experiment["maximum_parameter_budget"]),
+        "capability_full_budget_update": int(experiment["capability_full_budget_update"]),
+        "proxy_reward_window": int(experiment["proxy_reward_window"]),
+        "proxy_minimum_reward_gain": float(experiment["proxy_minimum_reward_gain"]),
+        "proxy_widen_parameters": int(experiment["proxy_widen_parameters"]),
+    }
+    methods = {
+        "dynamic_scheduled_socket": {
+            "candidate": dynamic_candidate,
+            "adapter": single_adapter,
+            "frozen_entries": [],
+            "dynamic_socket": dynamic_contract,
+        },
+        "static_socket": {
+            "candidate": static_candidate,
+            "adapter": single_adapter,
+            "frozen_entries": frozen_single_entries,
+            "dynamic_socket": None,
+        },
+        "uniform_direct_rl": {
+            "candidate": uniform,
+            "adapter": uniform_adapter,
+            "frozen_entries": [],
+            "dynamic_socket": None,
+        },
+    }
+    results: dict[str, list[dict[str, Any]]] = {}
+    for method, specification in methods.items():
+        results[method] = [
+            _run_candidate_subprocess(
+                config_path,
+                root,
+                specification["candidate"],
+                int(seed),
+                int(experiment["updates"]),
+                "confirmation-dynamic-socket",
+                method=method,
+                starting_adapters=[str(specification["adapter"].resolve())],
+                job_overrides={
+                    "task_mix": {"arithmetic": 1},
+                    "frozen_entries": specification["frozen_entries"],
+                    "dynamic_socket": specification["dynamic_socket"],
+                    "evaluation_every": int(experiment["evaluation_every"]),
+                    "monitoring_split": "valid",
+                    "kl_reference_kind": "scheduled_sft_checkpoint",
+                    "ppo": ppo,
+                    "health": health,
+                },
+            )
+            for seed in experiment["seeds"]
+        ]
+        for row in results[method]:
+            for health_row in row["health_tail"]:
+                if health_row.get("active_socket_parameter_count", 0) > health_row.get(
+                    "dynamic_parameter_budget", sys.maxsize
+                ):
+                    raise RuntimeError("scheduled socket exceeded its active parameter budget")
+    report = summarize_dynamic_socket_test(
+        audit=audit,
+        frozen=frozen,
+        baselines=baselines,
+        results=results,
+        direct_results=direct_results,
+        direct_baseline=float(direct_baseline),
+        schedule=schedule,
+        gain_recovery_target=float(experiment["gain_recovery_target"]),
+        bootstrap_draws=int(config["confirmation"]["bootstrap_draws"]),
+    )
+    _write_atomic_json(root / "dynamic_socket_result.json", report)
+    _write_atomic_json(root / "latest_result.json", report)
+    return report
+
+
 def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
     root = Path(root)
     manifest_path = root / "joint_sft/manifest.json"
@@ -1444,6 +1597,85 @@ def summarize_composite_socket_test(
     return {**body, "result_hash": _hash(body)}
 
 
+def summarize_dynamic_socket_test(
+    *,
+    audit: Mapping[str, Any],
+    frozen: Mapping[str, Any],
+    baselines: Mapping[str, Mapping[str, Any]],
+    results: Mapping[str, Sequence[Mapping[str, Any]]],
+    direct_results: Sequence[Mapping[str, Any]],
+    direct_baseline: float,
+    schedule: Mapping[str, Any],
+    gain_recovery_target: float,
+    bootstrap_draws: int,
+) -> dict[str, Any]:
+    all_results = {**results, "single_layer_direct_rl_reference": direct_results}
+    paths = {}
+    for name, rows in all_results.items():
+        if name == "single_layer_direct_rl_reference":
+            baseline = {
+                "accuracy": direct_baseline,
+                "outcomes": baselines["dynamic_scheduled_socket"]["test"]["arithmetic"]["outcomes"],
+            }
+        else:
+            baseline = baselines[name]["test"]["arithmetic"]
+        arithmetic = [float(row["behavior"]["arithmetic"]["accuracy"]) for row in rows]
+        python = [float(row["behavior"]["python"]["accuracy"]) for row in rows]
+        interval = _arithmetic_paired_interval(rows, baseline, draws=bootstrap_draws)
+        healthy = all(not row["unhealthy"] and not row["aborted_early"] for row in rows)
+        paths[name] = {
+            "sft_arithmetic_accuracy": float(baseline["accuracy"]),
+            "arithmetic_accuracy_by_seed": arithmetic,
+            "mean_arithmetic_accuracy": float(np.mean(arithmetic)),
+            "mean_gain_over_sft": float(np.mean(arithmetic)) - float(baseline["accuracy"]),
+            "gain_interval": interval,
+            "python_retention_by_seed": python,
+            "mean_kl_by_seed": [float(row["kl_divergence"]) for row in rows],
+            "healthy": healthy,
+            "eligible": healthy and min(python) >= 0.99 and interval["lower"] > 0,
+            "generated_tokens": sum(int(row["generated_tokens"]) for row in rows),
+        }
+        if name == "dynamic_scheduled_socket":
+            paths[name]["mask_by_seed"] = [row.get("dynamic_socket") for row in rows]
+    pairwise = {
+        f"dynamic_scheduled_socket_minus_{name}": _arithmetic_between_interval(
+            all_results["dynamic_scheduled_socket"], rows, draws=bootstrap_draws
+        )
+        for name, rows in all_results.items()
+        if name != "dynamic_scheduled_socket"
+    }
+    dynamic_gain = paths["dynamic_scheduled_socket"]["mean_gain_over_sft"]
+    direct_gain = paths["single_layer_direct_rl_reference"]["mean_gain_over_sft"]
+    recovery = dynamic_gain / direct_gain if direct_gain > 0 else None
+    allowed_loss = (1.0 - gain_recovery_target) * direct_gain
+    versus_direct = pairwise["dynamic_scheduled_socket_minus_single_layer_direct_rl_reference"]
+    point_target_met = recovery is not None and recovery >= gain_recovery_target
+    confidence_target_met = versus_direct["lower"] >= -allowed_loss
+    static_advantage = pairwise["dynamic_scheduled_socket_minus_static_socket"]
+    supported = (
+        paths["dynamic_scheduled_socket"]["eligible"]
+        and point_target_met
+        and confidence_target_met
+        and static_advantage["lower"] > 0
+    )
+    body = {
+        "schema": f"{SCHEMA}.dynamic_socket_result.v1",
+        "audit_hash": audit["audit_hash"],
+        "frozen_behavior": frozen["test"],
+        "schedule": dict(schedule),
+        "gain_recovery_target": gain_recovery_target,
+        "gain_recovery_fraction": recovery,
+        "point_target_met": point_target_met,
+        "confidence_target_met": confidence_target_met,
+        "dynamic_beats_static": static_advantage["lower"] > 0,
+        "paths": paths,
+        "pairwise_intervals": pairwise,
+        "verdict": "DYNAMIC_SOCKET_RECOVERS_95_PERCENT" if supported else "DYNAMIC_SOCKET_BELOW_TARGET",
+        "completed_at": utc_now(),
+    }
+    return {**body, "result_hash": _hash(body)}
+
+
 def _arithmetic_between_interval(
     left: Sequence[Mapping[str, Any]],
     right: Sequence[Mapping[str, Any]],
@@ -1520,6 +1752,12 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     generated_tokens = 0
     current_beta = ppo_config.beta
     abort_reason: str | None = None
+    dynamic_config = job.get("dynamic_socket")
+    if dynamic_config and float(ppo_config.weight_decay) != 0.0:
+        raise ValueError("scheduled socket masks require zero RL weight decay")
+    active_entries = set(dynamic_config.get("initial_active_entries", [])) if dynamic_config else set()
+    dynamic_budget = int(dynamic_config["initial_parameter_budget"]) if dynamic_config else 0
+    force_reprobe = bool(dynamic_config)
     latest = _latest_checkpoint(candidate_dir / "checkpoints")
     if latest:
         loaded = load_checkpoint(latest, model=model, optimizer=optimizer, sampler=sampler)
@@ -1529,6 +1767,13 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         health_history = list(state["health_history"])
         generated_tokens = int(state["generated_tokens"])
         current_beta = float(state.get("current_beta", current_beta))
+        if dynamic_config and health_history:
+            active_entries = set(health_history[-1].get("active_socket_entries", active_entries))
+            dynamic_budget = int(health_history[-1].get(
+                "dynamic_parameter_budget_next",
+                health_history[-1].get("dynamic_parameter_budget", dynamic_budget),
+            ))
+            force_reprobe = bool(health_history[-1].get("force_reprobe_next", False))
     data_root = root / "datasets"
     datasets = {
         task: _read_jsonl(data_root / task / "train.jsonl")
@@ -1597,11 +1842,44 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             (loss, metrics), gradients = loss_and_grad()
             mx.eval(loss, *metrics.values(), *[value for _, value in tree_flatten(gradients)], *before.values())
             gradients, gradient_norm = clip_gradients(gradients, ppo_config.max_grad_norm)
-            epoch_entry_gradient_norms.append(gradient_norms_by_entry(gradients, job["candidate"]))
+            current_entry_norms = gradient_norms_by_entry(gradients, job["candidate"])
+            epoch_entry_gradient_norms.append(current_entry_norms)
+            if dynamic_config and (
+                force_reprobe
+                or update % int(dynamic_config["reprobe_every_updates"]) == 0
+            ):
+                if (
+                    dynamic_config.get("phase") == "capability"
+                    and update + 1 >= int(dynamic_config["capability_full_budget_update"])
+                ):
+                    dynamic_budget = int(dynamic_config["maximum_parameter_budget"])
+                window = int(dynamic_config["probe_window_updates"])
+                recent_norms = [
+                    row["gradient_norm_by_entry"]
+                    for row in health_history[-window:]
+                    if "gradient_norm_by_entry" in row
+                ] + [current_entry_norms]
+                averaged_norms = {
+                    key: float(np.mean([row.get(key, 0.0) for row in recent_norms]))
+                    for key in current_entry_norms
+                }
+                active_entries = select_scheduled_socket_entries(
+                    job["candidate"],
+                    averaged_norms,
+                    current_entries=active_entries,
+                    reserve_entries=set(dynamic_config["reserve_entries"]),
+                    parameter_budget=dynamic_budget,
+                    hysteresis_ratio=float(dynamic_config["hysteresis_ratio"]),
+                )
+                force_reprobe = False
+            inactive_entries = (
+                {entry_key(entry) for entry in job["candidate"]["entries"]} - active_entries
+                if dynamic_config else set()
+            )
             gradients = mask_frozen_entry_gradients(
                 gradients,
                 job["candidate"],
-                set(job.get("frozen_entries", [])),
+                set(job.get("frozen_entries", [])) | inactive_entries,
             )
             finite = all(bool(mx.all(mx.isfinite(value))) for _, value in tree_flatten(gradients))
             if not finite:
@@ -1645,6 +1923,15 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             "peak_memory_bytes": int(mx.get_peak_memory()),
             "kl_beta": current_beta,
         }
+        if dynamic_config:
+            counts = _entry_parameter_counts(job["candidate"])
+            health.update({
+                "active_socket_entries": sorted(active_entries),
+                "active_socket_parameter_count": sum(counts[key] for key in active_entries),
+                "dynamic_parameter_budget": dynamic_budget,
+                "reserve_socket_entries": sorted(dynamic_config["reserve_entries"]),
+                "socket_phase": dynamic_config["phase"],
+            })
         if health["kl_divergence"] > float(job["health"]["kl_threshold"]):
             current_beta = min(
                 float(job["health"].get("kl_beta_max", 2.0)),
@@ -1666,6 +1953,21 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                 limit=int(job["evaluation"]["limit"]),
                 split=str(job.get("monitoring_split", job["evaluation"]["split"])),
             )
+            if dynamic_config and proxy_true_gap_detected(
+                health_history,
+                health,
+                reward_window=int(dynamic_config["proxy_reward_window"]),
+                minimum_reward_gain=float(dynamic_config["proxy_minimum_reward_gain"]),
+            ):
+                previous_budget = dynamic_budget
+                dynamic_budget = min(
+                    int(dynamic_config["maximum_parameter_budget"]),
+                    dynamic_budget + int(dynamic_config["proxy_widen_parameters"]),
+                )
+                force_reprobe = dynamic_budget > previous_budget
+                health["proxy_true_gap_detected"] = True
+                health["dynamic_parameter_budget_next"] = dynamic_budget
+                health["force_reprobe_next"] = force_reprobe
         health_history.append(health)
         update += 1
         abort_reason = _health_abort_reason(health_history, job["health"])
@@ -1705,6 +2007,22 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     summary["optimizer_trainable_parameters"] = sum(
         int(value.size) for _, value in tree_flatten(model.trainable_parameters())
     )
+    if dynamic_config:
+        mask_rows = [row for row in health_history if "active_socket_entries" in row]
+        all_keys = [entry_key(entry) for entry in job["candidate"]["entries"]]
+        summary["dynamic_socket"] = {
+            "phase": dynamic_config["phase"],
+            "reprobe_every_updates": int(dynamic_config["reprobe_every_updates"]),
+            "reserve_entries": list(dynamic_config["reserve_entries"]),
+            "final_active_entries": sorted(active_entries),
+            "final_parameter_budget": dynamic_budget,
+            "proxy_true_gap_events": sum(bool(row.get("proxy_true_gap_detected")) for row in mask_rows),
+            "entry_active_fraction": {
+                key: float(np.mean([key in row["active_socket_entries"] for row in mask_rows]))
+                if mask_rows else 0.0
+                for key in all_keys
+            },
+        }
     summary["task_mix"] = dict(job.get("task_mix", {"arithmetic": 1, "python": 1}))
     summary["heldout_evaluation_curve"] = [
         {"update": row["update"], **row["heldout_behavior"]}
@@ -2420,6 +2738,7 @@ def _checkpoint_job(
             + list(job.get("starting_adapters", []))
         ],
         "frozen_entries": list(job.get("frozen_entries", [])),
+        "dynamic_socket": job.get("dynamic_socket"),
         "quantization": "QLoRA RL with frozen 4-bit base",
         "lora": job["adapter_contract"],
         "optimizer": {"constructor": "mlx.optimizers.AdamW", **job["optimizer"], "learning_rate": job["ppo"]["learning_rate"], "weight_decay": job["ppo"]["weight_decay"]},
@@ -2582,6 +2901,30 @@ def _compose_sockets(
     return {**body, "socket_hash": _hash(body)}
 
 
+def _scheduled_socket(socket: Mapping[str, Any], identifier: str) -> dict[str, Any]:
+    """Add a low-rank depth reserve while preserving the 2.4M socket budget."""
+    primary = [
+        {"layer": int(entry["layer"]), "family": str(entry["family"]), "rank": 63}
+        for entry in socket["entries"]
+    ]
+    reserve = [
+        {"layer": layer, "family": "B", "rank": 4, "reserve": True}
+        for layer in (0, 4, 8, 12, 16, 20)
+    ]
+    scheduled = create_socket(
+        identifier,
+        [
+            {key: value for key, value in entry.items() if key != "reserve"}
+            for entry in primary + reserve
+        ],
+        generation="scheduled-socket-with-depth-reserve",
+        model_id=str(socket["model_id"]),
+        model_revision=str(socket["model_revision"]),
+    )
+    reserve_keys = [entry_key(entry) for entry in reserve]
+    return _rehash_socket({**scheduled, "reserve_entries": reserve_keys})
+
+
 def _tag_topology(socket: Mapping[str, Any], *, arm: str) -> dict[str, Any]:
     tagged = dict(socket)
     tagged["arm"] = arm
@@ -2633,6 +2976,66 @@ def _freeze_candidate_entries(
             if module is None:
                 raise ValueError(f"candidate entry lacks module {module_name}")
             module.freeze()
+
+
+def _entry_parameter_counts(candidate: Mapping[str, Any]) -> dict[str, int]:
+    return {
+        entry_key(entry): FAMILY_PARAMS_PER_RANK[str(entry["family"])] * int(entry["rank"])
+        for entry in candidate["entries"]
+    }
+
+
+def select_scheduled_socket_entries(
+    candidate: Mapping[str, Any],
+    gradient_norms: Mapping[str, float],
+    *,
+    current_entries: set[str],
+    reserve_entries: set[str],
+    parameter_budget: int,
+    hysteresis_ratio: float,
+) -> set[str]:
+    """Select a budgeted socket mask using parameter-normalized saliency."""
+    counts = _entry_parameter_counts(candidate)
+    missing = reserve_entries - set(counts)
+    if missing:
+        raise ValueError(f"reserve entries are absent from candidate: {sorted(missing)}")
+    selected = set(reserve_entries)
+    used = sum(counts[key] for key in selected)
+    if used > parameter_budget:
+        raise ValueError("reserve entries exceed the active parameter budget")
+    scored = []
+    for key, count in counts.items():
+        if key in reserve_entries:
+            continue
+        score = float(gradient_norms.get(key, 0.0)) / math.sqrt(max(1, count))
+        if key in current_entries:
+            score /= max(1e-6, hysteresis_ratio)
+        scored.append((score, key))
+    for _, key in sorted(scored, key=lambda item: (-item[0], item[1])):
+        if used + counts[key] <= parameter_budget:
+            selected.add(key)
+            used += counts[key]
+    return selected
+
+
+def proxy_true_gap_detected(
+    history: Sequence[Mapping[str, Any]],
+    current: Mapping[str, Any],
+    *,
+    reward_window: int,
+    minimum_reward_gain: float,
+) -> bool:
+    if "heldout_behavior" not in current:
+        return False
+    prior_evaluations = [row for row in history if "heldout_behavior" in row]
+    if not prior_evaluations or len(history) + 1 < reward_window * 2:
+        return False
+    rewards = [float(row["mean_task_reward"]) for row in [*history, current]]
+    previous_reward = float(np.mean(rewards[-2 * reward_window:-reward_window]))
+    recent_reward = float(np.mean(rewards[-reward_window:]))
+    previous_accuracy = float(prior_evaluations[-1]["heldout_behavior"]["arithmetic"]["accuracy"])
+    current_accuracy = float(current["heldout_behavior"]["arithmetic"]["accuracy"])
+    return recent_reward >= previous_reward + minimum_reward_gain and current_accuracy <= previous_accuracy
 
 
 def mask_frozen_entry_gradients(
@@ -2851,6 +3254,9 @@ def main() -> None:
     composite = subparsers.add_parser("composite-socket-test")
     composite.add_argument("--config", required=True, type=Path)
     composite.add_argument("--run", required=True, type=Path)
+    dynamic = subparsers.add_parser("dynamic-socket-test")
+    dynamic.add_argument("--config", required=True, type=Path)
+    dynamic.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -2870,6 +3276,8 @@ def main() -> None:
         result = run_placement_confirmation(args.config, args.run)
     elif args.command == "composite-socket-test":
         result = run_composite_socket_test(args.config, args.run)
+    elif args.command == "dynamic-socket-test":
+        result = run_dynamic_socket_test(args.config, args.run)
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))
