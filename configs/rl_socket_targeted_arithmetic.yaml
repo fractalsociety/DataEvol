@@ -1,6 +1,6 @@
 {
   "schema": "dataevol.rl_socket_v2.config.v1",
-  "run_id": "rl-socket-targeted-arithmetic-v1d-confirmation",
+  "run_id": "rl-socket-targeted-arithmetic-v1e-confirmation",
   "model": {
     "id": "mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit",
     "path": ".dataevol/models/tinyllama-1.1b-chat-4bit",
@@ -90,7 +90,7 @@
     "protected_entry_fraction": 0.33,
     "gradient_profile_examples_per_task": 8,
     "evaluation_every": 20,
-    "updates": 100,
+    "updates": 60,
     "seeds": [17, 29]
   },
   "checkpoint_every": 20,

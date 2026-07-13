@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
@@ -86,6 +87,11 @@ def test_config_rejects_small_groups_and_loose_parameter_matching() -> None:
         assert "at least eight" in str(error)
     else:
         raise AssertionError("undersized rollout group was accepted")
+
+
+def test_targeted_confirmation_budget_is_pinned_to_sixty_updates() -> None:
+    config = json.loads(Path("configs/rl_socket_targeted_arithmetic.yaml").read_text())
+    assert config["targeted_arithmetic"]["updates"] == 60
 
 
 def test_training_rewards_are_behavioral_and_shaping_is_gated() -> None:
