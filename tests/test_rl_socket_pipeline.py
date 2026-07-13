@@ -10,6 +10,7 @@ from dataevol.experiments.reusable_lora_socket import generate_socket_candidates
 from dataevol.experiments.rl_socket_pipeline import (
     FAMILIES,
     _arithmetic_behavioral_reward,
+    _arithmetic_paired_interval,
     _contiguous_socket,
     _health_abort_reason,
     _mechanistic_socket,
@@ -22,6 +23,7 @@ from dataevol.experiments.rl_socket_pipeline import (
     mask_frozen_entry_gradients,
     prepare_joint_sft_curriculum,
     prepare_targeted_arithmetic_curriculum,
+    prepare_uniform_kl_sweep_curriculum,
     select_python_protected_entries,
 )
 
@@ -92,6 +94,8 @@ def test_config_rejects_small_groups_and_loose_parameter_matching() -> None:
 def test_targeted_confirmation_budget_is_pinned_to_sixty_updates() -> None:
     config = json.loads(Path("configs/rl_socket_targeted_arithmetic.yaml").read_text())
     assert config["targeted_arithmetic"]["updates"] == 60
+    assert config["uniform_kl_sweep"]["updates"] == 60
+    assert [row["learning_rate"] for row in config["uniform_kl_sweep"]["schedules"]] == [1e-5, 5e-6, 2e-6]
 
 
 def test_training_rewards_are_behavioral_and_shaping_is_gated() -> None:
@@ -174,6 +178,32 @@ def test_targeted_arithmetic_curriculum_is_disjoint_and_in_learnable_range(tmp_p
     assert "What is" in valid
     assert "Compute" in test
     assert manifest["splits"]["train"]["sha256"] != manifest["splits"]["valid"]["sha256"]
+
+
+def test_uniform_sweep_uses_new_locked_test_panel(tmp_path) -> None:
+    source = tmp_path / "source"
+    prepare_joint_sft_curriculum(source)
+    prepare_targeted_arithmetic_curriculum(source, source)
+
+    manifest = prepare_uniform_kl_sweep_curriculum(tmp_path / "sweep", source)
+
+    test = (tmp_path / "sweep/datasets/arithmetic/test.jsonl").read_text()
+    assert "Find the total" in test
+    assert manifest["test_rows"] == 500
+    assert manifest["test_sha256"] != json.loads(
+        (source / "datasets/targeted_manifest.json").read_text()
+    )["splits"]["test"]["sha256"]
+
+
+def test_arithmetic_interval_is_paired_against_same_prompts() -> None:
+    baseline = {"outcomes": [False, False, True, False]}
+    rows = [
+        {"behavior": {"arithmetic": {"outcomes": [True, True, True, False]}}},
+        {"behavior": {"arithmetic": {"outcomes": [True, False, True, True]}}},
+    ]
+    interval = _arithmetic_paired_interval(rows, baseline, draws=2_000)
+    assert interval["mean_difference"] == 0.5
+    assert interval["lower"] > 0
 
 
 def test_entry_gradient_logging_and_masking_use_socket_entries() -> None:

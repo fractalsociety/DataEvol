@@ -93,6 +93,35 @@
     "updates": 60,
     "seeds": [17, 29]
   },
+  "uniform_kl_sweep": {
+    "source_run": ".dataevol/experiments/rl_socket_targeted_arithmetic_v1e",
+    "updates": 60,
+    "evaluation_every": 20,
+    "seeds": [17, 29],
+    "schedules": [
+      {
+        "id": "control-lr1e-5-beta0.2",
+        "learning_rate": 0.00001,
+        "beta": 0.2,
+        "max_grad_norm": 0.5,
+        "kl_beta_max": 2.0
+      },
+      {
+        "id": "lr5e-6-beta0.4",
+        "learning_rate": 0.000005,
+        "beta": 0.4,
+        "max_grad_norm": 0.5,
+        "kl_beta_max": 4.0
+      },
+      {
+        "id": "lr2e-6-beta0.4",
+        "learning_rate": 0.000002,
+        "beta": 0.4,
+        "max_grad_norm": 0.5,
+        "kl_beta_max": 4.0
+      }
+    ]
+  },
   "checkpoint_every": 20,
   "single_candidate_concurrency": 1,
   "post_training_precision_evaluation": ["4-bit"],

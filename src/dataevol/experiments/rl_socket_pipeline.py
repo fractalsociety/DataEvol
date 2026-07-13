@@ -542,6 +542,81 @@ def run_targeted_arithmetic_test(config_path: str | Path, run_dir: str | Path) -
     return summary
 
 
+def run_uniform_kl_sweep(config_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
+    """Confirm whether smaller policy steps make uniform post-SFT RL eligible."""
+    config_path = Path(config_path)
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    audit = _read_json(root / "trainer_audit.json")
+    if audit["verdict"] != "ELIGIBLE" or audit["git_commit"] != _git_commit():
+        raise RuntimeError("uniform KL sweep requires an ELIGIBLE audit for the current Git commit")
+    config = _read_json(config_path)
+    _validate_config(config)
+    sweep = config["uniform_kl_sweep"]
+    source = Path(sweep["source_run"])
+    prepare_uniform_kl_sweep_curriculum(root, source)
+    frozen = _evaluate_frozen_base(config, root)
+    uniform = _tag_topology(
+        parameter_matched_uniform(int(config["adapter"]["target_parameters"])),
+        arm="uniform_kl_sweep",
+    )
+    adapter_path = source / "topology_sft/uniform/adapters.safetensors"
+    baseline = _evaluate_adapter(config, root, uniform, adapter_path)
+    source_report = _read_json(source / "targeted_arithmetic_result.json")
+    protected = list(source_report["protected_python_entries"]["uniform"])
+    results: dict[str, list[dict[str, Any]]] = {}
+    for schedule in sweep["schedules"]:
+        schedule_id = str(schedule["id"])
+        candidate = _tag_topology(
+            _clone_socket(uniform, f"uniform-{schedule_id}"),
+            arm="uniform_kl_sweep",
+        )
+        ppo = {
+            **config["ppo"],
+            "learning_rate": float(schedule["learning_rate"]),
+            "beta": float(schedule["beta"]),
+            "max_grad_norm": float(schedule["max_grad_norm"]),
+        }
+        health = {
+            **config["health"],
+            "kl_beta_max": float(schedule["kl_beta_max"]),
+        }
+        results[schedule_id] = [
+            _run_candidate_subprocess(
+                config_path,
+                root,
+                candidate,
+                int(seed),
+                int(sweep["updates"]),
+                "confirmation-uniform-kl-sweep",
+                method=schedule_id,
+                starting_adapter=str(adapter_path.resolve()),
+                job_overrides={
+                    "task_mix": {"arithmetic": 1},
+                    "frozen_entries": protected,
+                    "evaluation_every": int(sweep["evaluation_every"]),
+                    "monitoring_split": "valid",
+                    "kl_reference_kind": "sft_checkpoint",
+                    "ppo": ppo,
+                    "health": health,
+                },
+            )
+            for seed in sweep["seeds"]
+        ]
+    report = summarize_uniform_kl_sweep(
+        audit=audit,
+        frozen=frozen,
+        baseline=baseline,
+        protected=protected,
+        schedules=sweep["schedules"],
+        results=results,
+        bootstrap_draws=int(config["confirmation"]["bootstrap_draws"]),
+    )
+    _write_atomic_json(root / "uniform_kl_sweep_result.json", report)
+    _write_atomic_json(root / "latest_result.json", report)
+    return report
+
+
 def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
     root = Path(root)
     manifest_path = root / "joint_sft/manifest.json"
@@ -629,6 +704,41 @@ def prepare_targeted_arithmetic_curriculum(root: str | Path, source: str | Path)
     manifest["manifest_hash"] = _hash(manifest)
     _write_atomic_json(manifest_path, manifest)
     return manifest
+
+
+def prepare_uniform_kl_sweep_curriculum(root: str | Path, source: str | Path) -> dict[str, Any]:
+    """Reuse train/validation data but create a new locked confirmation panel."""
+    root = Path(root)
+    source = Path(source)
+    manifest_path = root / "datasets/uniform_kl_sweep_manifest.json"
+    if manifest_path.is_file():
+        return _read_json(manifest_path)
+    for task in ("arithmetic", "python"):
+        for split in ("train", "valid"):
+            _copy_atomic(source / f"datasets/{task}/{split}.jsonl", root / f"datasets/{task}/{split}.jsonl")
+    _copy_atomic(source / "datasets/python/test.jsonl", root / "datasets/python/test.jsonl")
+    rng = random.Random("uniform-kl-sweep-v3-unseen:test:7319")
+    rows = []
+    for index in range(500):
+        a, b = rng.randint(0, 4), rng.randint(0, 4)
+        rows.append({
+            "id": f"uniform-kl-sweep-test-{index:04d}",
+            "family": "small_integer_addition",
+            "prompt": f"Find the total of {a} and {b}. Respond using only one integer.",
+            "completion": str(a + b),
+            "answer": str(a + b),
+        })
+    test_path = root / "datasets/arithmetic/test.jsonl"
+    _write_atomic_jsonl(test_path, rows)
+    body = {
+        "schema": f"{SCHEMA}.uniform_kl_sweep_curriculum.v1",
+        "source_run": str(source),
+        "test_rows": len(rows),
+        "test_sha256": _file_hash(test_path),
+    }
+    report = {**body, "manifest_hash": _hash(body)}
+    _write_atomic_json(manifest_path, report)
+    return report
 
 
 def _evaluate_adapter(
@@ -765,6 +875,84 @@ def summarize_targeted_arithmetic(
         "completed_at": utc_now(),
     }
     return {**body, "result_hash": _hash(body)}
+
+
+def summarize_uniform_kl_sweep(
+    *,
+    audit: Mapping[str, Any],
+    frozen: Mapping[str, Any],
+    baseline: Mapping[str, Any],
+    protected: Sequence[str],
+    schedules: Sequence[Mapping[str, Any]],
+    results: Mapping[str, Sequence[Mapping[str, Any]]],
+    bootstrap_draws: int,
+) -> dict[str, Any]:
+    baseline_arithmetic = baseline["test"]["arithmetic"]
+    schedule_reports: dict[str, Any] = {}
+    for schedule in schedules:
+        schedule_id = str(schedule["id"])
+        rows = results[schedule_id]
+        interval = _arithmetic_paired_interval(rows, baseline_arithmetic, draws=bootstrap_draws)
+        arithmetic = [float(row["behavior"]["arithmetic"]["accuracy"]) for row in rows]
+        python = [float(row["behavior"]["python"]["accuracy"]) for row in rows]
+        healthy = all(not row["unhealthy"] and not row["aborted_early"] for row in rows)
+        eligible = healthy and min(python) >= 0.99 and interval["lower"] > 0
+        schedule_reports[schedule_id] = {
+            "config": dict(schedule),
+            "seeds": [int(row["seed"]) for row in rows],
+            "updates": [int(row["updates"]) for row in rows],
+            "arithmetic_accuracy_by_seed": arithmetic,
+            "mean_arithmetic_accuracy": float(np.mean(arithmetic)),
+            "mean_gain_over_sft": float(np.mean(arithmetic)) - float(baseline_arithmetic["accuracy"]),
+            "python_retention_by_seed": python,
+            "mean_kl_by_seed": [float(row["kl_divergence"]) for row in rows],
+            "abort_reasons": [row.get("abort_reason") for row in rows],
+            "paired_interval": interval,
+            "healthy": healthy,
+            "eligible": eligible,
+            "result_hashes": [row["result_hash"] for row in rows],
+        }
+    eligible = [
+        (identifier, report)
+        for identifier, report in schedule_reports.items()
+        if report["eligible"]
+    ]
+    winner = max(eligible, key=lambda item: item[1]["mean_arithmetic_accuracy"])[0] if eligible else None
+    body = {
+        "schema": f"{SCHEMA}.uniform_kl_sweep_result.v1",
+        "audit_hash": audit["audit_hash"],
+        "frozen_behavior": frozen["test"],
+        "uniform_sft_baseline": baseline,
+        "protected_python_entries": list(protected),
+        "schedules": schedule_reports,
+        "winning_schedule": winner,
+        "verdict": "ELIGIBLE_UNIFORM_RL_SCHEDULE" if winner else "NO_ELIGIBLE_UNIFORM_RL_SCHEDULE",
+        "completed_at": utc_now(),
+    }
+    return {**body, "result_hash": _hash(body)}
+
+
+def _arithmetic_paired_interval(
+    rows: Sequence[Mapping[str, Any]],
+    baseline: Mapping[str, Any],
+    *,
+    draws: int,
+) -> dict[str, float]:
+    baseline_outcomes = np.asarray(baseline["outcomes"], dtype=float)
+    differences = np.concatenate([
+        np.asarray(row["behavior"]["arithmetic"]["outcomes"], dtype=float) - baseline_outcomes
+        for row in rows
+    ])
+    rng = np.random.default_rng(7319)
+    bootstrap = np.mean(
+        rng.choice(differences, size=(draws, len(differences)), replace=True),
+        axis=1,
+    )
+    return {
+        "mean_difference": float(np.mean(differences)),
+        "lower": float(np.quantile(bootstrap, 0.025)),
+        "upper": float(np.quantile(bootstrap, 0.975)),
+    }
 
 
 def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
@@ -2072,6 +2260,9 @@ def main() -> None:
     targeted = subparsers.add_parser("targeted-arithmetic-test")
     targeted.add_argument("--config", required=True, type=Path)
     targeted.add_argument("--run", required=True, type=Path)
+    uniform_sweep = subparsers.add_parser("uniform-kl-sweep")
+    uniform_sweep.add_argument("--config", required=True, type=Path)
+    uniform_sweep.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -2085,6 +2276,8 @@ def main() -> None:
         result = run_sft_then_rl_test(args.config, args.run)
     elif args.command == "targeted-arithmetic-test":
         result = run_targeted_arithmetic_test(args.config, args.run)
+    elif args.command == "uniform-kl-sweep":
+        result = run_uniform_kl_sweep(args.config, args.run)
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))
