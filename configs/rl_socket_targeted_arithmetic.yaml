@@ -122,6 +122,22 @@
       }
     ]
   },
+  "placement_confirmation": {
+    "dataset_source_run": ".dataevol/experiments/rl_uniform_kl_sweep_v1",
+    "targeted_source_run": ".dataevol/experiments/rl_socket_targeted_arithmetic_v1e",
+    "socket_source_run": ".dataevol/experiments/rl_socket_sft_then_rl_v1",
+    "updates": 60,
+    "evaluation_every": 20,
+    "seeds": [17, 29],
+    "protected_entry_fraction": 0.33,
+    "gradient_profile_examples_per_task": 8,
+    "schedule": {
+      "learning_rate": 0.000005,
+      "beta": 0.4,
+      "max_grad_norm": 0.5,
+      "kl_beta_max": 4.0
+    }
+  },
   "checkpoint_every": 20,
   "single_candidate_concurrency": 1,
   "post_training_precision_evaluation": ["4-bit"],

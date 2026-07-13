@@ -617,6 +617,123 @@ def run_uniform_kl_sweep(config_path: str | Path, run_dir: str | Path) -> dict[s
     return report
 
 
+def run_placement_confirmation(config_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
+    """Isolate adapter placement under one exact budget and training schedule."""
+    config_path = Path(config_path)
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    audit = _read_json(root / "trainer_audit.json")
+    if audit["verdict"] != "ELIGIBLE" or audit["git_commit"] != _git_commit():
+        raise RuntimeError("placement confirmation requires an ELIGIBLE audit for the current Git commit")
+    config = _read_json(config_path)
+    _validate_config(config)
+    experiment = config["placement_confirmation"]
+    dataset_source = Path(experiment["dataset_source_run"])
+    targeted_source = Path(experiment["targeted_source_run"])
+    socket_source = Path(experiment["socket_source_run"])
+    prepare_placement_confirmation_curriculum(root, dataset_source)
+    frozen = _evaluate_frozen_base(config, root)
+
+    socket_report = _read_json(socket_source / "sft_then_rl_result.json")
+    target = int(config["adapter"]["target_parameters"])
+    candidates = {
+        "socket_a": _tag_topology(_clone_socket(socket_report["candidate"], "placement-socket-a"), arm="placement_confirmation"),
+        "uniform": _tag_topology(_clone_socket(parameter_matched_uniform(target), "placement-uniform"), arm="placement_confirmation"),
+        "single_layer_2": _tag_topology(
+            parameter_matched_single(2, target, socket_id="placement-single-layer-2"),
+            arm="placement_confirmation",
+        ),
+    }
+    _assert_placement_parameter_contract(candidates, target, float(config["adapter"]["maximum_parameter_mismatch"]))
+    uniform_sft_dir = root / "topology_sft/uniform-exact"
+    uniform_training = train_socket_expert(
+        model_path=config["model"]["path"],
+        socket=candidates["uniform"],
+        data_dir=socket_source / "joint_sft",
+        output_dir=uniform_sft_dir,
+        task="exact-budget-joint-arithmetic-python-sft",
+        config=TrainConfig(
+            optimizer_steps=int(config["sft"]["optimizer_steps"]),
+            batch_size=1,
+            grad_accumulation=1,
+            max_seq_length=int(config["sft"]["max_seq_length"]),
+            learning_rate=float(config["sft"]["learning_rate"]),
+            weight_decay=float(config["sft"]["weight_decay"]),
+            lora_scale=float(config["adapter"]["lora_scale"]),
+            lora_dropout=float(config["adapter"]["dropout"]),
+        ),
+        seed=int(config["sft"]["seed"]),
+    )
+    adapters = {
+        "socket_a": socket_source / "joint_sft_adapter/adapters.safetensors",
+        "uniform": uniform_sft_dir / "adapters.safetensors",
+        "single_layer_2": targeted_source / "topology_sft/single-2/adapters.safetensors",
+    }
+    baselines = {
+        name: _evaluate_adapter(config, root, candidate, adapters[name])
+        for name, candidate in candidates.items()
+    }
+    protected = {}
+    for name, candidate in candidates.items():
+        profile = profile_entry_gradients(
+            config,
+            root,
+            candidate,
+            adapters[name],
+            limit=int(experiment["gradient_profile_examples_per_task"]),
+        )
+        protected[name] = select_python_protected_entries(
+            profile,
+            count=max(1, round(len(candidate["entries"]) * float(experiment["protected_entry_fraction"]))),
+        )
+    schedule = experiment["schedule"]
+    ppo = {
+        **config["ppo"],
+        "learning_rate": float(schedule["learning_rate"]),
+        "beta": float(schedule["beta"]),
+        "max_grad_norm": float(schedule["max_grad_norm"]),
+    }
+    health = {**config["health"], "kl_beta_max": float(schedule["kl_beta_max"])}
+    results: dict[str, list[dict[str, Any]]] = {}
+    for name, candidate in candidates.items():
+        results[name] = [
+            _run_candidate_subprocess(
+                config_path,
+                root,
+                candidate,
+                int(seed),
+                int(experiment["updates"]),
+                "confirmation-placement",
+                method=name,
+                starting_adapter=str(adapters[name].resolve()),
+                job_overrides={
+                    "task_mix": {"arithmetic": 1},
+                    "frozen_entries": protected[name],
+                    "evaluation_every": int(experiment["evaluation_every"]),
+                    "monitoring_split": "valid",
+                    "kl_reference_kind": "sft_checkpoint",
+                    "ppo": ppo,
+                    "health": health,
+                },
+            )
+            for seed in experiment["seeds"]
+        ]
+    report = summarize_placement_confirmation(
+        audit=audit,
+        frozen=frozen,
+        candidates=candidates,
+        baselines=baselines,
+        protected=protected,
+        uniform_training=uniform_training,
+        schedule=schedule,
+        results=results,
+        bootstrap_draws=int(config["confirmation"]["bootstrap_draws"]),
+    )
+    _write_atomic_json(root / "placement_confirmation_result.json", report)
+    _write_atomic_json(root / "latest_result.json", report)
+    return report
+
+
 def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
     root = Path(root)
     manifest_path = root / "joint_sft/manifest.json"
@@ -739,6 +856,52 @@ def prepare_uniform_kl_sweep_curriculum(root: str | Path, source: str | Path) ->
     report = {**body, "manifest_hash": _hash(body)}
     _write_atomic_json(manifest_path, report)
     return report
+
+
+def prepare_placement_confirmation_curriculum(root: str | Path, source: str | Path) -> dict[str, Any]:
+    """Create a placement-only confirmation panel not used by schedule selection."""
+    root = Path(root)
+    source = Path(source)
+    manifest_path = root / "datasets/placement_confirmation_manifest.json"
+    if manifest_path.is_file():
+        return _read_json(manifest_path)
+    for task in ("arithmetic", "python"):
+        for split in ("train", "valid"):
+            _copy_atomic(source / f"datasets/{task}/{split}.jsonl", root / f"datasets/{task}/{split}.jsonl")
+    _copy_atomic(source / "datasets/python/test.jsonl", root / "datasets/python/test.jsonl")
+    rng = random.Random("placement-confirmation-v4-unseen:test:9109")
+    rows = []
+    for index in range(500):
+        a, b = rng.randint(0, 4), rng.randint(0, 4)
+        rows.append({
+            "id": f"placement-confirmation-test-{index:04d}",
+            "family": "small_integer_addition",
+            "prompt": f"What total do you get from {a} together with {b}? Output one integer only.",
+            "completion": str(a + b),
+            "answer": str(a + b),
+        })
+    test_path = root / "datasets/arithmetic/test.jsonl"
+    _write_atomic_jsonl(test_path, rows)
+    body = {
+        "schema": f"{SCHEMA}.placement_confirmation_curriculum.v1",
+        "source_run": str(source),
+        "test_rows": len(rows),
+        "test_sha256": _file_hash(test_path),
+    }
+    report = {**body, "manifest_hash": _hash(body)}
+    _write_atomic_json(manifest_path, report)
+    return report
+
+
+def _assert_placement_parameter_contract(
+    candidates: Mapping[str, Mapping[str, Any]],
+    target: int,
+    maximum_mismatch: float,
+) -> None:
+    for name, candidate in candidates.items():
+        mismatch = abs(int(candidate["trainable_parameters"]) - target) / target
+        if mismatch > maximum_mismatch:
+            raise ValueError(f"{name} parameter mismatch {mismatch:.4%} exceeds {maximum_mismatch:.4%}")
 
 
 def _evaluate_adapter(
@@ -948,6 +1111,91 @@ def _arithmetic_paired_interval(
         rng.choice(differences, size=(draws, len(differences)), replace=True),
         axis=1,
     )
+    return {
+        "mean_difference": float(np.mean(differences)),
+        "lower": float(np.quantile(bootstrap, 0.025)),
+        "upper": float(np.quantile(bootstrap, 0.975)),
+    }
+
+
+def summarize_placement_confirmation(
+    *,
+    audit: Mapping[str, Any],
+    frozen: Mapping[str, Any],
+    candidates: Mapping[str, Mapping[str, Any]],
+    baselines: Mapping[str, Mapping[str, Any]],
+    protected: Mapping[str, Sequence[str]],
+    uniform_training: Mapping[str, Any],
+    schedule: Mapping[str, Any],
+    results: Mapping[str, Sequence[Mapping[str, Any]]],
+    bootstrap_draws: int,
+) -> dict[str, Any]:
+    placements = {}
+    for name, rows in results.items():
+        baseline = baselines[name]["test"]["arithmetic"]
+        interval = _arithmetic_paired_interval(rows, baseline, draws=bootstrap_draws)
+        arithmetic = [float(row["behavior"]["arithmetic"]["accuracy"]) for row in rows]
+        python = [float(row["behavior"]["python"]["accuracy"]) for row in rows]
+        healthy = all(not row["unhealthy"] and not row["aborted_early"] for row in rows)
+        eligible = healthy and min(python) >= 0.99 and interval["lower"] > 0
+        placements[name] = {
+            "trainable_parameters": int(candidates[name]["trainable_parameters"]),
+            "socket_hash": candidates[name]["socket_hash"],
+            "sft_arithmetic_accuracy": float(baseline["accuracy"]),
+            "arithmetic_accuracy_by_seed": arithmetic,
+            "mean_arithmetic_accuracy": float(np.mean(arithmetic)),
+            "mean_gain_over_sft": float(np.mean(arithmetic)) - float(baseline["accuracy"]),
+            "python_retention_by_seed": python,
+            "mean_kl_by_seed": [float(row["kl_divergence"]) for row in rows],
+            "updates": [int(row["updates"]) for row in rows],
+            "abort_reasons": [row.get("abort_reason") for row in rows],
+            "gain_interval": interval,
+            "healthy": healthy,
+            "eligible": eligible,
+            "result_hashes": [row["result_hash"] for row in rows],
+        }
+    pairwise = {}
+    names = list(results)
+    for left_index, left in enumerate(names):
+        for right in names[left_index + 1:]:
+            pairwise[f"{left}_minus_{right}"] = _arithmetic_between_interval(
+                results[left], results[right], draws=bootstrap_draws
+            )
+    raw_ranking = sorted(placements, key=lambda name: placements[name]["mean_arithmetic_accuracy"], reverse=True)
+    eligible_ranking = [name for name in raw_ranking if placements[name]["eligible"]]
+    winner = eligible_ranking[0] if eligible_ranking else None
+    body = {
+        "schema": f"{SCHEMA}.placement_confirmation_result.v1",
+        "audit_hash": audit["audit_hash"],
+        "frozen_behavior": frozen["test"],
+        "schedule": dict(schedule),
+        "protected_python_entries": {key: list(value) for key, value in protected.items()},
+        "uniform_sft_training": uniform_training,
+        "placements": placements,
+        "pairwise_intervals": pairwise,
+        "raw_ranking": raw_ranking,
+        "eligible_ranking": eligible_ranking,
+        "winning_placement": winner,
+        "verdict": "ELIGIBLE_PLACEMENT_WINNER" if winner else "NO_ELIGIBLE_PLACEMENT",
+        "completed_at": utc_now(),
+    }
+    return {**body, "result_hash": _hash(body)}
+
+
+def _arithmetic_between_interval(
+    left: Sequence[Mapping[str, Any]],
+    right: Sequence[Mapping[str, Any]],
+    *,
+    draws: int,
+) -> dict[str, float]:
+    count = min(len(left), len(right))
+    differences = np.concatenate([
+        np.asarray(left[index]["behavior"]["arithmetic"]["outcomes"], dtype=float)
+        - np.asarray(right[index]["behavior"]["arithmetic"]["outcomes"], dtype=float)
+        for index in range(count)
+    ])
+    rng = np.random.default_rng(9109)
+    bootstrap = np.mean(rng.choice(differences, size=(draws, len(differences)), replace=True), axis=1)
     return {
         "mean_difference": float(np.mean(differences)),
         "lower": float(np.quantile(bootstrap, 0.025)),
@@ -2263,6 +2511,9 @@ def main() -> None:
     uniform_sweep = subparsers.add_parser("uniform-kl-sweep")
     uniform_sweep.add_argument("--config", required=True, type=Path)
     uniform_sweep.add_argument("--run", required=True, type=Path)
+    placement = subparsers.add_parser("placement-confirmation")
+    placement.add_argument("--config", required=True, type=Path)
+    placement.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -2278,6 +2529,8 @@ def main() -> None:
         result = run_targeted_arithmetic_test(args.config, args.run)
     elif args.command == "uniform-kl-sweep":
         result = run_uniform_kl_sweep(args.config, args.run)
+    elif args.command == "placement-confirmation":
+        result = run_placement_confirmation(args.config, args.run)
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))

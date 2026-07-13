@@ -156,8 +156,13 @@ def socket_parameter_count(entries: Iterable[Mapping[str, Any]]) -> int:
 
 def parameter_matched_uniform(target: int) -> dict[str, Any]:
     layers = (0, 4, 8, 12, 16, 20)
-    rank = _closest_rank(target, len(layers) * FAMILY_PARAMS_PER_RANK["A"])
-    return create_socket("uniform", ({"layer": layer, "family": "A", "rank": rank} for layer in layers), generation="baseline-uniform")
+    total_rank = round(target / FAMILY_PARAMS_PER_RANK["A"])
+    base_rank, remainder = divmod(total_rank, len(layers))
+    entries = (
+        {"layer": layer, "family": "A", "rank": base_rank + int(index < remainder)}
+        for index, layer in enumerate(layers)
+    )
+    return create_socket("uniform", entries, generation="baseline-uniform")
 
 
 def parameter_matched_single(layer: int, target: int, *, socket_id: str | None = None) -> dict[str, Any]:

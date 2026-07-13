@@ -6,14 +6,16 @@ from pathlib import Path
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
 
-from dataevol.experiments.reusable_lora_socket import generate_socket_candidates
+from dataevol.experiments.reusable_lora_socket import generate_socket_candidates, parameter_matched_uniform
 from dataevol.experiments.rl_socket_pipeline import (
     FAMILIES,
     _arithmetic_behavioral_reward,
+    _arithmetic_between_interval,
     _arithmetic_paired_interval,
     _contiguous_socket,
     _health_abort_reason,
     _mechanistic_socket,
+    _assert_placement_parameter_contract,
     _python_public_test_fraction,
     _training_reward,
     _validate_config,
@@ -22,6 +24,7 @@ from dataevol.experiments.rl_socket_pipeline import (
     gradient_norms_by_entry,
     mask_frozen_entry_gradients,
     prepare_joint_sft_curriculum,
+    prepare_placement_confirmation_curriculum,
     prepare_targeted_arithmetic_curriculum,
     prepare_uniform_kl_sweep_curriculum,
     select_python_protected_entries,
@@ -57,6 +60,7 @@ def test_equal_search_arms_and_half_percent_parameter_contract(tmp_path) -> None
 
 def test_mechanistic_sockets_are_exactly_parameter_matched() -> None:
     sockets = [
+        parameter_matched_uniform(2_400_000),
         _mechanistic_socket("mlp-only", "C", 2_400_000),
         _mechanistic_socket("attention-only", "A", 2_400_000),
         _contiguous_socket(2_400_000),
@@ -64,6 +68,7 @@ def test_mechanistic_sockets_are_exactly_parameter_matched() -> None:
 
     for socket in sockets:
         assert abs(socket["trainable_parameters"] - 2_400_000) / 2_400_000 <= 0.005
+    assert sockets[0]["trainable_parameters"] == 2_400_000
 
 
 def test_config_rejects_small_groups_and_loose_parameter_matching() -> None:
@@ -95,6 +100,8 @@ def test_targeted_confirmation_budget_is_pinned_to_sixty_updates() -> None:
     config = json.loads(Path("configs/rl_socket_targeted_arithmetic.yaml").read_text())
     assert config["targeted_arithmetic"]["updates"] == 60
     assert config["uniform_kl_sweep"]["updates"] == 60
+    assert config["placement_confirmation"]["updates"] == 60
+    assert config["placement_confirmation"]["schedule"]["learning_rate"] == 5e-6
     assert [row["learning_rate"] for row in config["uniform_kl_sweep"]["schedules"]] == [1e-5, 5e-6, 2e-6]
 
 
@@ -195,6 +202,31 @@ def test_uniform_sweep_uses_new_locked_test_panel(tmp_path) -> None:
     )["splits"]["test"]["sha256"]
 
 
+def test_placement_confirmation_uses_fourth_panel(tmp_path) -> None:
+    source = tmp_path / "source"
+    prepare_joint_sft_curriculum(source)
+    prepare_targeted_arithmetic_curriculum(source, source)
+    prepare_uniform_kl_sweep_curriculum(source, source)
+
+    manifest = prepare_placement_confirmation_curriculum(tmp_path / "placement", source)
+
+    test = (tmp_path / "placement/datasets/arithmetic/test.jsonl").read_text()
+    assert "What total do you get" in test
+    assert manifest["test_rows"] == 500
+
+
+def test_placement_parameter_contract_rejects_old_uniform_budget() -> None:
+    exact = parameter_matched_uniform(2_400_000)
+    _assert_placement_parameter_contract({"uniform": exact}, 2_400_000, 0.005)
+    inexact = {**exact, "trainable_parameters": 2_380_800}
+    try:
+        _assert_placement_parameter_contract({"uniform": inexact}, 2_400_000, 0.005)
+    except ValueError as error:
+        assert "parameter mismatch" in str(error)
+    else:
+        raise AssertionError("out-of-contract uniform budget was accepted")
+
+
 def test_arithmetic_interval_is_paired_against_same_prompts() -> None:
     baseline = {"outcomes": [False, False, True, False]}
     rows = [
@@ -204,6 +236,12 @@ def test_arithmetic_interval_is_paired_against_same_prompts() -> None:
     interval = _arithmetic_paired_interval(rows, baseline, draws=2_000)
     assert interval["mean_difference"] == 0.5
     assert interval["lower"] > 0
+
+    between = _arithmetic_between_interval(rows, [
+        {"behavior": {"arithmetic": baseline}},
+        {"behavior": {"arithmetic": baseline}},
+    ], draws=2_000)
+    assert between["mean_difference"] == 0.5
 
 
 def test_entry_gradient_logging_and_masking_use_socket_entries() -> None:
