@@ -38,6 +38,7 @@ from dataevol.experiments.rl_socket_pipeline import (
     proxy_true_gap_detected,
     select_scheduled_socket_entries,
     select_python_protected_entries,
+    summarize_warm_start_dynamic_socket_test,
 )
 
 
@@ -115,6 +116,8 @@ def test_targeted_confirmation_budget_is_pinned_to_sixty_updates() -> None:
     assert config["composite_socket"]["required_start_accuracy_band"] == [0.20, 0.60]
     assert config["dynamic_socket"]["gain_recovery_target"] == 0.95
     assert config["dynamic_socket"]["reprobe_every_updates"] == 5
+    assert config["warm_start_dynamic_socket"]["gain_recovery_target"] == 0.95
+    assert config["warm_start_dynamic_socket"]["maximum_parameter_budget"] == 2_500_000
     assert config["placement_confirmation"]["schedule"]["learning_rate"] == 5e-6
     assert [row["learning_rate"] for row in config["uniform_kl_sweep"]["schedules"]] == [1e-5, 5e-6, 2e-6]
 
@@ -323,6 +326,39 @@ def test_proxy_true_gap_requires_rising_reward_and_flat_heldout_behavior() -> No
     assert not proxy_true_gap_detected(
         history, current, reward_window=10, minimum_reward_gain=0.01
     )
+
+
+def test_warm_start_summary_requires_gain_recovery_and_reports_overallocation() -> None:
+    baseline = {"accuracy": 0.0, "outcomes": [False, False, False, False]}
+    row = {
+        "behavior": {
+            "arithmetic": {"accuracy": 1.0, "outcomes": [True, True, True, True]},
+            "python": {"accuracy": 1.0},
+        },
+        "unhealthy": False,
+        "aborted_early": False,
+        "kl_divergence": 0.01,
+        "health_tail": [{"active_socket_parameter_count": 2_500_000}],
+        "dynamic_socket": {"final_active_entries": ["layer-2:family-A"]},
+    }
+
+    report = summarize_warm_start_dynamic_socket_test(
+        audit={"audit_hash": "audit"},
+        frozen={"test": {}},
+        baseline=baseline,
+        results=[row, row],
+        direct_results=[row, row],
+        gain_recovery_target=0.95,
+        prior_entries=["layer-2:family-A"],
+        prior_adapter_hash="adapter",
+        optimizer_candidate_parameters=4_800_000,
+        bootstrap_draws=500,
+    )
+
+    assert report["verdict"] == "WARM_START_RECOVERS_95_PERCENT"
+    assert report["gain_recovery_fraction"] == 1.0
+    assert report["optimizer_memory_proxy"]["over_allocation_ratio"] == 1.92
+    assert not report["optimizer_memory_proxy"]["deferred_state_allocation_implemented"]
 
 
 def test_placement_parameter_contract_rejects_old_uniform_budget() -> None:

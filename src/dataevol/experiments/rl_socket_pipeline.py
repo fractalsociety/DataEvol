@@ -1013,6 +1013,113 @@ def run_dynamic_socket_test(config_path: str | Path, run_dir: str | Path) -> dic
     return report
 
 
+def run_warm_start_dynamic_socket_test(config_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
+    """Use the SFT LayerScope result as the initial mask and schedule only drift."""
+    config_path = Path(config_path)
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    audit = _read_json(root / "trainer_audit.json")
+    if audit["verdict"] != "ELIGIBLE" or audit["git_commit"] != _git_commit():
+        raise RuntimeError("warm-start socket test requires an ELIGIBLE audit for the current Git commit")
+    config = _read_json(config_path)
+    _validate_config(config)
+    experiment = config["warm_start_dynamic_socket"]
+    single_source = Path(experiment["single_layer_source_run"])
+    socket_source = Path(experiment["socket_source_run"])
+    direct_reference_root = Path(experiment["direct_reference_run"])
+    prepare_composite_socket_curriculum(root, single_source)
+    frozen = _evaluate_frozen_base(config, root)
+
+    target = int(config["adapter"]["target_parameters"])
+    single = parameter_matched_single(2, target, socket_id="warm-single-layer-2")
+    socket_report = _read_json(socket_source / "sft_then_rl_result.json")
+    scheduled = _scheduled_socket(socket_report["candidate"], "warm-scheduled-socket-a")
+    candidate = _tag_topology(
+        _compose_sockets("warm-layer-2-plus-socket", single, scheduled),
+        arm="warm_start_dynamic_socket",
+    )
+    single_adapter = single_source / "topology_sft/single-2/adapters.safetensors"
+    baseline = _evaluate_adapter_stack(config, root, candidate, [single_adapter])
+    direct_report = _read_json(direct_reference_root / "composite_socket_result.json")
+    direct_baseline = float(direct_report["paths"]["single_layer_direct_rl"]["sft_arithmetic_accuracy"])
+    if abs(float(baseline["test"]["arithmetic"]["accuracy"]) - direct_baseline) > 1e-12:
+        raise RuntimeError("warm-start panel does not match the direct-layer reference")
+    direct_results = [
+        _read_json(direct_reference_root / f"jobs/composite-single-layer-2/seed-{seed}/latest_result.json")
+        for seed in experiment["seeds"]
+    ]
+
+    schedule = experiment["schedule"]
+    ppo = {
+        **config["ppo"],
+        "learning_rate": float(schedule["learning_rate"]),
+        "beta": float(schedule["beta"]),
+        "max_grad_norm": float(schedule["max_grad_norm"]),
+    }
+    health = {**config["health"], "kl_beta_max": float(schedule["kl_beta_max"])}
+    prior_entries = [entry_key(entry) for entry in single["entries"]]
+    reserve_entries = list(scheduled["reserve_entries"])
+    dynamic_contract = {
+        "phase": "capability_warm_start",
+        "initial_active_entries": prior_entries + reserve_entries,
+        "reserve_entries": reserve_entries,
+        "reprobe_on_first_update": False,
+        "reprobe_every_updates": int(experiment["reprobe_every_updates"]),
+        "probe_window_updates": int(experiment["probe_window_updates"]),
+        "hysteresis_ratio": float(experiment["hysteresis_ratio"]),
+        "initial_parameter_budget": int(experiment["maximum_parameter_budget"]),
+        "maximum_parameter_budget": int(experiment["maximum_parameter_budget"]),
+        "capability_full_budget_update": 1,
+        "proxy_reward_window": int(experiment["proxy_reward_window"]),
+        "proxy_minimum_reward_gain": float(experiment["proxy_minimum_reward_gain"]),
+        "proxy_widen_parameters": 0,
+    }
+    results = [
+        _run_candidate_subprocess(
+            config_path,
+            root,
+            candidate,
+            int(seed),
+            int(experiment["updates"]),
+            "confirmation-warm-start-dynamic-socket",
+            method="warm_start_dynamic_socket",
+            starting_adapters=[str(single_adapter.resolve())],
+            job_overrides={
+                "task_mix": {"arithmetic": 1},
+                "frozen_entries": [],
+                "dynamic_socket": dynamic_contract,
+                "evaluation_every": int(experiment["evaluation_every"]),
+                "monitoring_split": "valid",
+                "kl_reference_kind": "sft_layerscope_warm_start",
+                "ppo": ppo,
+                "health": health,
+            },
+        )
+        for seed in experiment["seeds"]
+    ]
+    for row in results:
+        for health_row in row["health_tail"]:
+            if health_row.get("active_socket_parameter_count", 0) > int(
+                experiment["maximum_parameter_budget"]
+            ):
+                raise RuntimeError("warm-start socket exceeded its active parameter budget")
+    report = summarize_warm_start_dynamic_socket_test(
+        audit=audit,
+        frozen=frozen,
+        baseline=baseline["test"]["arithmetic"],
+        results=results,
+        direct_results=direct_results,
+        gain_recovery_target=float(experiment["gain_recovery_target"]),
+        prior_entries=prior_entries,
+        prior_adapter_hash=_file_hash(single_adapter),
+        optimizer_candidate_parameters=int(candidate["trainable_parameters"]),
+        bootstrap_draws=int(config["confirmation"]["bootstrap_draws"]),
+    )
+    _write_atomic_json(root / "warm_start_dynamic_socket_result.json", report)
+    _write_atomic_json(root / "latest_result.json", report)
+    return report
+
+
 def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
     root = Path(root)
     manifest_path = root / "joint_sft/manifest.json"
@@ -1676,6 +1783,82 @@ def summarize_dynamic_socket_test(
     return {**body, "result_hash": _hash(body)}
 
 
+def summarize_warm_start_dynamic_socket_test(
+    *,
+    audit: Mapping[str, Any],
+    frozen: Mapping[str, Any],
+    baseline: Mapping[str, Any],
+    results: Sequence[Mapping[str, Any]],
+    direct_results: Sequence[Mapping[str, Any]],
+    gain_recovery_target: float,
+    prior_entries: Sequence[str],
+    prior_adapter_hash: str,
+    optimizer_candidate_parameters: int,
+    bootstrap_draws: int,
+) -> dict[str, Any]:
+    warm_accuracy = [float(row["behavior"]["arithmetic"]["accuracy"]) for row in results]
+    direct_accuracy = [float(row["behavior"]["arithmetic"]["accuracy"]) for row in direct_results]
+    warm_gain = float(np.mean(warm_accuracy)) - float(baseline["accuracy"])
+    direct_gain = float(np.mean(direct_accuracy)) - float(baseline["accuracy"])
+    recovery = warm_gain / direct_gain if direct_gain > 0 else None
+    warm_interval = _arithmetic_paired_interval(results, baseline, draws=bootstrap_draws)
+    paired = _arithmetic_between_interval(results, direct_results, draws=bootstrap_draws)
+    allowed_loss = (1.0 - gain_recovery_target) * direct_gain
+    point_target_met = recovery is not None and recovery >= gain_recovery_target
+    confidence_target_met = paired["lower"] >= -allowed_loss
+    healthy = all(not row["unhealthy"] and not row["aborted_early"] for row in results)
+    python = [float(row["behavior"]["python"]["accuracy"]) for row in results]
+    active_counts = [
+        int(health["active_socket_parameter_count"])
+        for row in results
+        for health in row["health_tail"]
+        if "active_socket_parameter_count" in health
+    ]
+    supported = (
+        healthy
+        and min(python) >= 0.99
+        and warm_interval["lower"] > 0
+        and point_target_met
+        and confidence_target_met
+    )
+    body = {
+        "schema": f"{SCHEMA}.warm_start_dynamic_socket_result.v1",
+        "audit_hash": audit["audit_hash"],
+        "frozen_behavior": frozen["test"],
+        "sft_prior": {
+            "entries": list(prior_entries),
+            "adapter_sha256": prior_adapter_hash,
+        },
+        "sft_arithmetic_accuracy": float(baseline["accuracy"]),
+        "warm_accuracy_by_seed": warm_accuracy,
+        "mean_warm_accuracy": float(np.mean(warm_accuracy)),
+        "warm_gain": warm_gain,
+        "warm_gain_interval": warm_interval,
+        "direct_accuracy_by_seed": direct_accuracy,
+        "mean_direct_accuracy": float(np.mean(direct_accuracy)),
+        "direct_gain": direct_gain,
+        "warm_minus_direct_interval": paired,
+        "gain_recovery_target": gain_recovery_target,
+        "gain_recovery_fraction": recovery,
+        "point_target_met": point_target_met,
+        "confidence_target_met": confidence_target_met,
+        "python_retention_by_seed": python,
+        "mean_kl_by_seed": [float(row["kl_divergence"]) for row in results],
+        "healthy": healthy,
+        "mask_by_seed": [row["dynamic_socket"] for row in results],
+        "optimizer_memory_proxy": {
+            "candidate_parameters_with_moments": optimizer_candidate_parameters,
+            "mean_active_parameters": float(np.mean(active_counts)),
+            "maximum_active_parameters": max(active_counts),
+            "over_allocation_ratio": optimizer_candidate_parameters / max(1.0, float(np.mean(active_counts))),
+            "deferred_state_allocation_implemented": False,
+        },
+        "verdict": "WARM_START_RECOVERS_95_PERCENT" if supported else "WARM_START_BELOW_TARGET",
+        "completed_at": utc_now(),
+    }
+    return {**body, "result_hash": _hash(body)}
+
+
 def _arithmetic_between_interval(
     left: Sequence[Mapping[str, Any]],
     right: Sequence[Mapping[str, Any]],
@@ -1757,7 +1940,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         raise ValueError("scheduled socket masks require zero RL weight decay")
     active_entries = set(dynamic_config.get("initial_active_entries", [])) if dynamic_config else set()
     dynamic_budget = int(dynamic_config["initial_parameter_budget"]) if dynamic_config else 0
-    force_reprobe = bool(dynamic_config)
+    force_reprobe = bool(dynamic_config and dynamic_config.get("reprobe_on_first_update", True))
     latest = _latest_checkpoint(candidate_dir / "checkpoints")
     if latest:
         loaded = load_checkpoint(latest, model=model, optimizer=optimizer, sampler=sampler)
@@ -1844,10 +2027,17 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             gradients, gradient_norm = clip_gradients(gradients, ppo_config.max_grad_norm)
             current_entry_norms = gradient_norms_by_entry(gradients, job["candidate"])
             epoch_entry_gradient_norms.append(current_entry_norms)
-            if dynamic_config and (
-                force_reprobe
-                or update % int(dynamic_config["reprobe_every_updates"]) == 0
-            ):
+            reprobe_due = bool(
+                dynamic_config
+                and (
+                    force_reprobe
+                    or (
+                        (update > 0 or dynamic_config.get("reprobe_on_first_update", True))
+                        and update % int(dynamic_config["reprobe_every_updates"]) == 0
+                    )
+                )
+            )
+            if dynamic_config and reprobe_due:
                 if (
                     dynamic_config.get("phase") == "capability"
                     and update + 1 >= int(dynamic_config["capability_full_budget_update"])
@@ -3257,6 +3447,9 @@ def main() -> None:
     dynamic = subparsers.add_parser("dynamic-socket-test")
     dynamic.add_argument("--config", required=True, type=Path)
     dynamic.add_argument("--run", required=True, type=Path)
+    warm = subparsers.add_parser("warm-start-dynamic-socket-test")
+    warm.add_argument("--config", required=True, type=Path)
+    warm.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -3278,6 +3471,8 @@ def main() -> None:
         result = run_composite_socket_test(args.config, args.run)
     elif args.command == "dynamic-socket-test":
         result = run_dynamic_socket_test(args.config, args.run)
+    elif args.command == "warm-start-dynamic-socket-test":
+        result = run_warm_start_dynamic_socket_test(args.config, args.run)
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))
