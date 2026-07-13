@@ -125,6 +125,7 @@ def test_health_abort_requires_sustained_failure() -> None:
 
 def test_joint_sft_curriculum_covers_python_families_in_every_split(tmp_path) -> None:
     manifest = prepare_joint_sft_curriculum(tmp_path)
+    assert prepare_joint_sft_curriculum(tmp_path) == manifest
 
     assert manifest["python_function_families"] == 8
     assert manifest["splits"]["train"]["rows"] == 4_000

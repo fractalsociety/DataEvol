@@ -419,6 +419,9 @@ def run_sft_then_rl_test(config_path: str | Path, run_dir: str | Path) -> dict[s
 
 def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
     root = Path(root)
+    manifest_path = root / "joint_sft/manifest.json"
+    if manifest_path.is_file():
+        return _read_json(manifest_path)
     prepare_datasets(root / "datasets")
     python_variants = [
         ("def clamp(x, low, high):\n    return min(low, max(x, high))", "def clamp(x, low, high):\n    return max(low, min(x, high))"),
@@ -458,7 +461,7 @@ def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
         manifest["splits"][split] = {"rows": len(rows), "sha256": _file_hash(path)}
     manifest["python_function_families"] = len(python_variants)
     manifest["manifest_hash"] = _hash(manifest)
-    _write_atomic_json(joint / "manifest.json", manifest)
+    _write_atomic_json(manifest_path, manifest)
     return manifest
 
 
