@@ -6,13 +6,19 @@ from pathlib import Path
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
 
-from dataevol.experiments.reusable_lora_socket import generate_socket_candidates, parameter_matched_uniform
+from dataevol.experiments.reusable_lora_socket import (
+    generate_socket_candidates,
+    parameter_matched_single,
+    parameter_matched_uniform,
+)
 from dataevol.experiments.rl_socket_pipeline import (
     FAMILIES,
     _arithmetic_behavioral_reward,
     _arithmetic_between_interval,
     _arithmetic_paired_interval,
     _contiguous_socket,
+    _compose_sockets,
+    _freeze_candidate_entries,
     _health_abort_reason,
     _mechanistic_socket,
     _assert_placement_parameter_contract,
@@ -24,6 +30,7 @@ from dataevol.experiments.rl_socket_pipeline import (
     gradient_norms_by_entry,
     mask_frozen_entry_gradients,
     prepare_joint_sft_curriculum,
+    prepare_composite_socket_curriculum,
     prepare_placement_confirmation_curriculum,
     prepare_targeted_arithmetic_curriculum,
     prepare_uniform_kl_sweep_curriculum,
@@ -101,6 +108,8 @@ def test_targeted_confirmation_budget_is_pinned_to_sixty_updates() -> None:
     assert config["targeted_arithmetic"]["updates"] == 60
     assert config["uniform_kl_sweep"]["updates"] == 60
     assert config["placement_confirmation"]["updates"] == 60
+    assert config["composite_socket"]["updates"] == 60
+    assert config["composite_socket"]["required_start_accuracy_band"] == [0.20, 0.60]
     assert config["placement_confirmation"]["schedule"]["learning_rate"] == 5e-6
     assert [row["learning_rate"] for row in config["uniform_kl_sweep"]["schedules"]] == [1e-5, 5e-6, 2e-6]
 
@@ -215,6 +224,33 @@ def test_placement_confirmation_uses_fourth_panel(tmp_path) -> None:
     assert manifest["test_rows"] == 500
 
 
+def test_composite_socket_uses_harder_fifth_panel(tmp_path) -> None:
+    source = tmp_path / "source"
+    prepare_joint_sft_curriculum(source)
+
+    manifest = prepare_composite_socket_curriculum(tmp_path / "composite", source)
+
+    train = (tmp_path / "composite/datasets/arithmetic/train.jsonl").read_text()
+    test = (tmp_path / "composite/datasets/arithmetic/test.jsonl").read_text()
+    assert manifest["operand_range"] == [0, 7]
+    assert manifest["panel_version"] == "v5-unseen"
+    assert "Calculate this sum" in train
+    assert "What whole-number total" in test
+    assert manifest["splits"]["train"]["sha256"] != manifest["splits"]["test"]["sha256"]
+
+
+def test_composite_socket_reports_frozen_and_incremental_budgets() -> None:
+    single = parameter_matched_single(2, 2_400_000, socket_id="single")
+    socket = parameter_matched_uniform(2_400_000)
+
+    composite = _compose_sockets("composite", single, socket)
+
+    assert composite["frozen_sft_parameters"] == single["trainable_parameters"]
+    assert composite["incremental_rl_parameters"] == socket["trainable_parameters"]
+    assert composite["trainable_parameters"] == 4_799_232
+    assert len(composite["entries"]) == len(single["entries"]) + len(socket["entries"])
+
+
 def test_placement_parameter_contract_rejects_old_uniform_budget() -> None:
     exact = parameter_matched_uniform(2_400_000)
     _assert_placement_parameter_contract({"uniform": exact}, 2_400_000, 0.005)
@@ -264,6 +300,39 @@ def test_entry_gradient_logging_and_masking_use_socket_entries() -> None:
     assert norms == {"layer-3:family-C": 5.0, "layer-5:family-B": 12.0}
     assert bool(mx.all(masked["model.layers.3.mlp.down_proj.lora_a"] == 0))
     assert bool(mx.all(masked["model.layers.5.self_attn.o_proj.lora_a"] == 12))
+
+
+def test_frozen_entries_are_removed_from_autograd_modules() -> None:
+    class FakeModule:
+        def __init__(self) -> None:
+            self.frozen = False
+
+        def freeze(self) -> None:
+            self.frozen = True
+
+    class FakeLayer:
+        def __init__(self) -> None:
+            self.modules = {
+                "self_attn.q_proj": FakeModule(),
+                "self_attn.v_proj": FakeModule(),
+                "self_attn.o_proj": FakeModule(),
+                "mlp.down_proj": FakeModule(),
+            }
+
+        def named_modules(self):
+            return self.modules.items()
+
+    layer = FakeLayer()
+    model = type("FakeModel", (), {
+        "model": type("Inner", (), {"layers": [layer]})(),
+    })()
+    candidate = {"entries": [{"layer": 0, "family": "A", "rank": 1}]}
+
+    _freeze_candidate_entries(model, candidate, {"layer-0:family-A"})
+
+    assert layer.modules["self_attn.q_proj"].frozen
+    assert layer.modules["self_attn.v_proj"].frozen
+    assert not layer.modules["self_attn.o_proj"].frozen
 
 
 def test_python_protection_uses_task_specific_gradient_ratio() -> None:

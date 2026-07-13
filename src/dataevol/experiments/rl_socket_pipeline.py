@@ -28,6 +28,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from dataevol.experiments.reusable_lora_socket import (
     BANDS,
+    FAMILY_MODULES,
     FAMILY_PARAMS_PER_RANK,
     TrainConfig,
     _apply_socket,
@@ -734,6 +735,131 @@ def run_placement_confirmation(config_path: str | Path, run_dir: str | Path) -> 
     return report
 
 
+def run_composite_socket_test(config_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
+    """Test frozen single-layer SFT plus a fresh cross-layer RL socket."""
+    config_path = Path(config_path)
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    audit = _read_json(root / "trainer_audit.json")
+    if audit["verdict"] != "ELIGIBLE" or audit["git_commit"] != _git_commit():
+        raise RuntimeError("composite socket test requires an ELIGIBLE audit for the current Git commit")
+    config = _read_json(config_path)
+    _validate_config(config)
+    experiment = config["composite_socket"]
+    single_source = Path(experiment["single_layer_source_run"])
+    socket_source = Path(experiment["socket_source_run"])
+    prepare_composite_socket_curriculum(root, single_source)
+    frozen = _evaluate_frozen_base(config, root)
+
+    target = int(config["adapter"]["target_parameters"])
+    single = _tag_topology(
+        parameter_matched_single(2, target, socket_id="composite-single-layer-2"),
+        arm="composite_socket",
+    )
+    socket_report = _read_json(socket_source / "sft_then_rl_result.json")
+    socket = _tag_topology(
+        _clone_socket(socket_report["candidate"], "composite-socket-a"),
+        arm="composite_socket",
+    )
+    composite = _tag_topology(
+        _compose_sockets("single-layer-2-plus-socket-a", single, socket),
+        arm="composite_socket",
+    )
+    single_adapter = single_source / "topology_sft/single-2/adapters.safetensors"
+    socket_adapter = socket_source / "joint_sft_adapter/adapters.safetensors"
+    baselines = {
+        "single_layer_direct_rl": _evaluate_adapter(config, root, single, single_adapter),
+        "socket_direct_rl": _evaluate_adapter(config, root, socket, socket_adapter),
+        "frozen_single_layer_plus_socket_rl": _evaluate_adapter_stack(
+            config, root, composite, [single_adapter]
+        ),
+    }
+    if (
+        baselines["single_layer_direct_rl"]["test"]["arithmetic"]["outcomes"]
+        != baselines["frozen_single_layer_plus_socket_rl"]["test"]["arithmetic"]["outcomes"]
+    ):
+        raise RuntimeError("fresh socket changed the frozen SFT policy before RL")
+    start_accuracy = baselines["frozen_single_layer_plus_socket_rl"]["test"]["arithmetic"]["accuracy"]
+    lower, upper = map(float, experiment["required_start_accuracy_band"])
+    if not lower <= start_accuracy <= upper:
+        raise RuntimeError(
+            f"composite SFT start accuracy {start_accuracy:.4f} is outside [{lower:.4f}, {upper:.4f}]"
+        )
+
+    schedule = experiment["schedule"]
+    ppo = {
+        **config["ppo"],
+        "learning_rate": float(schedule["learning_rate"]),
+        "beta": float(schedule["beta"]),
+        "max_grad_norm": float(schedule["max_grad_norm"]),
+    }
+    health = {**config["health"], "kl_beta_max": float(schedule["kl_beta_max"])}
+    frozen_single_entries = [entry_key(entry) for entry in single["entries"]]
+    methods = {
+        "frozen_single_layer_plus_socket_rl": {
+            "candidate": composite,
+            "starting_adapters": [str(single_adapter.resolve())],
+            "frozen_entries": frozen_single_entries,
+        },
+        "single_layer_direct_rl": {
+            "candidate": single,
+            "starting_adapters": [str(single_adapter.resolve())],
+            "frozen_entries": [],
+        },
+        "socket_direct_rl": {
+            "candidate": socket,
+            "starting_adapters": [str(socket_adapter.resolve())],
+            "frozen_entries": [],
+        },
+    }
+    results: dict[str, list[dict[str, Any]]] = {}
+    for method, specification in methods.items():
+        candidate = specification["candidate"]
+        results[method] = [
+            _run_candidate_subprocess(
+                config_path,
+                root,
+                candidate,
+                int(seed),
+                int(experiment["updates"]),
+                "confirmation-composite-socket",
+                method=method,
+                starting_adapters=specification["starting_adapters"],
+                job_overrides={
+                    "task_mix": {"arithmetic": 1},
+                    "frozen_entries": specification["frozen_entries"],
+                    "evaluation_every": int(experiment["evaluation_every"]),
+                    "monitoring_split": "valid",
+                    "kl_reference_kind": "composed_sft_checkpoint",
+                    "ppo": ppo,
+                    "health": health,
+                },
+            )
+            for seed in experiment["seeds"]
+        ]
+        expected_trainable = int(
+            candidate.get("incremental_rl_parameters", candidate["trainable_parameters"])
+        )
+        if any(
+            int(row["optimizer_trainable_parameters"]) != expected_trainable
+            for row in results[method]
+        ):
+            raise RuntimeError(f"{method} optimizer parameter count violates the composite contract")
+    report = summarize_composite_socket_test(
+        audit=audit,
+        frozen=frozen,
+        candidates={name: row["candidate"] for name, row in methods.items()},
+        baselines=baselines,
+        results=results,
+        schedule=schedule,
+        frozen_single_entries=frozen_single_entries,
+        bootstrap_draws=int(config["confirmation"]["bootstrap_draws"]),
+    )
+    _write_atomic_json(root / "composite_socket_result.json", report)
+    _write_atomic_json(root / "latest_result.json", report)
+    return report
+
+
 def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
     root = Path(root)
     manifest_path = root / "joint_sft/manifest.json"
@@ -893,6 +1019,49 @@ def prepare_placement_confirmation_curriculum(root: str | Path, source: str | Pa
     return report
 
 
+def prepare_composite_socket_curriculum(root: str | Path, source: str | Path) -> dict[str, Any]:
+    """Create a harder fifth panel with enough SFT successes for RL."""
+    root = Path(root)
+    source = Path(source)
+    manifest_path = root / "datasets/composite_socket_manifest.json"
+    if manifest_path.is_file():
+        return _read_json(manifest_path)
+    for split in ("train", "valid", "test"):
+        _copy_atomic(source / f"datasets/python/{split}.jsonl", root / f"datasets/python/{split}.jsonl")
+    sizes = {"train": 2_000, "valid": 300, "test": 500}
+    prompts = {
+        "train": "Calculate this sum. Return one integer only.\n{a} + {b} = ?",
+        "valid": "Find the whole-number sum of {a} and {b}. Reply with one integer.",
+        "test": "What whole-number total results from combining {a} with {b}? Reply using one integer.",
+    }
+    splits = {}
+    for split, count in sizes.items():
+        rng = random.Random(f"composite-socket-v5:{split}:12013")
+        rows = []
+        for index in range(count):
+            a, b = rng.randint(0, 7), rng.randint(0, 7)
+            rows.append({
+                "id": f"composite-socket-{split}-{index:04d}",
+                "family": "expanded_small_integer_addition",
+                "prompt": prompts[split].format(a=a, b=b),
+                "completion": str(a + b),
+                "answer": str(a + b),
+            })
+        path = root / f"datasets/arithmetic/{split}.jsonl"
+        _write_atomic_jsonl(path, rows)
+        splits[split] = {"rows": count, "sha256": _file_hash(path)}
+    body = {
+        "schema": f"{SCHEMA}.composite_socket_curriculum.v1",
+        "source_run": str(source),
+        "operand_range": [0, 7],
+        "panel_version": "v5-unseen",
+        "splits": splits,
+    }
+    report = {**body, "manifest_hash": _hash(body)}
+    _write_atomic_json(manifest_path, report)
+    return report
+
+
 def _assert_placement_parameter_contract(
     candidates: Mapping[str, Mapping[str, Any]],
     target: int,
@@ -910,6 +1079,15 @@ def _evaluate_adapter(
     candidate: Mapping[str, Any],
     adapter_path: Path,
 ) -> dict[str, Any]:
+    return _evaluate_adapter_stack(config, root, candidate, [adapter_path])
+
+
+def _evaluate_adapter_stack(
+    config: Mapping[str, Any],
+    root: Path,
+    candidate: Mapping[str, Any],
+    adapter_paths: Sequence[Path],
+) -> dict[str, Any]:
     from mlx_lm import load
 
     model, tokenizer = load(config["model"]["path"])
@@ -919,7 +1097,8 @@ def _evaluate_adapter(
         scale=float(config["adapter"]["lora_scale"]),
         dropout=float(config["adapter"]["dropout"]),
     )
-    model.load_weights(list(mx.load(str(adapter_path)).items()), strict=False)
+    for adapter_path in adapter_paths:
+        model.load_weights(list(mx.load(str(adapter_path)).items()), strict=False)
     mx.eval(model.parameters())
     return {
         split: _evaluate_candidate(
@@ -1182,6 +1361,89 @@ def summarize_placement_confirmation(
     return {**body, "result_hash": _hash(body)}
 
 
+def summarize_composite_socket_test(
+    *,
+    audit: Mapping[str, Any],
+    frozen: Mapping[str, Any],
+    candidates: Mapping[str, Mapping[str, Any]],
+    baselines: Mapping[str, Mapping[str, Any]],
+    results: Mapping[str, Sequence[Mapping[str, Any]]],
+    schedule: Mapping[str, Any],
+    frozen_single_entries: Sequence[str],
+    bootstrap_draws: int,
+) -> dict[str, Any]:
+    paths = {}
+    for name, rows in results.items():
+        baseline = baselines[name]["test"]["arithmetic"]
+        interval = _arithmetic_paired_interval(rows, baseline, draws=bootstrap_draws)
+        arithmetic = [float(row["behavior"]["arithmetic"]["accuracy"]) for row in rows]
+        python = [float(row["behavior"]["python"]["accuracy"]) for row in rows]
+        healthy = all(not row["unhealthy"] and not row["aborted_early"] for row in rows)
+        eligible = healthy and min(python) >= 0.99 and interval["lower"] > 0
+        candidate = candidates[name]
+        paths[name] = {
+            "deployed_adapter_parameters": int(candidate["trainable_parameters"]),
+            "incremental_rl_parameters": int(
+                candidate.get("incremental_rl_parameters", candidate["trainable_parameters"])
+            ),
+            "sft_arithmetic_accuracy": float(baseline["accuracy"]),
+            "arithmetic_accuracy_by_seed": arithmetic,
+            "mean_arithmetic_accuracy": float(np.mean(arithmetic)),
+            "mean_gain_over_sft": float(np.mean(arithmetic)) - float(baseline["accuracy"]),
+            "gain_interval": interval,
+            "python_retention_by_seed": python,
+            "mean_kl_by_seed": [float(row["kl_divergence"]) for row in rows],
+            "updates": [int(row["updates"]) for row in rows],
+            "abort_reasons": [row.get("abort_reason") for row in rows],
+            "healthy": healthy,
+            "eligible": eligible,
+            "result_hashes": [row["result_hash"] for row in rows],
+        }
+    pairwise = {}
+    names = list(results)
+    for left_index, left in enumerate(names):
+        for right in names[left_index + 1:]:
+            pairwise[f"{left}_minus_{right}"] = _arithmetic_between_interval(
+                results[left], results[right], draws=bootstrap_draws
+            )
+    raw_ranking = sorted(paths, key=lambda name: paths[name]["mean_arithmetic_accuracy"], reverse=True)
+    eligible_ranking = [name for name in raw_ranking if paths[name]["eligible"]]
+    winner = eligible_ranking[0] if eligible_ranking else None
+    composite_name = "frozen_single_layer_plus_socket_rl"
+    composite_vs_direct = pairwise[f"{composite_name}_minus_single_layer_direct_rl"]
+    composite_supported = (
+        paths[composite_name]["eligible"]
+        and composite_vs_direct["lower"] > 0
+        and winner == composite_name
+    )
+    if composite_supported:
+        verdict = "COMPOSITE_PATH_SUPPORTED"
+    elif winner == "single_layer_direct_rl":
+        verdict = "SINGLE_LAYER_DIRECT_RL_BEST"
+    elif winner == "socket_direct_rl":
+        verdict = "SOCKET_DIRECT_RL_BEST"
+    elif paths[composite_name]["eligible"]:
+        verdict = "COMPOSITE_GAIN_WITHOUT_PATH_SUPERIORITY"
+    else:
+        verdict = "NO_ELIGIBLE_RL_PATH"
+    body = {
+        "schema": f"{SCHEMA}.composite_socket_result.v1",
+        "audit_hash": audit["audit_hash"],
+        "frozen_behavior": frozen["test"],
+        "schedule": dict(schedule),
+        "frozen_single_layer_entries": list(frozen_single_entries),
+        "paths": paths,
+        "pairwise_intervals": pairwise,
+        "raw_ranking": raw_ranking,
+        "eligible_ranking": eligible_ranking,
+        "winning_path": winner,
+        "composite_supported": composite_supported,
+        "verdict": verdict,
+        "completed_at": utc_now(),
+    }
+    return {**body, "result_hash": _hash(body)}
+
+
 def _arithmetic_between_interval(
     left: Sequence[Mapping[str, Any]],
     right: Sequence[Mapping[str, Any]],
@@ -1233,13 +1495,15 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         scale=float(job["adapter_contract"]["lora_scale"]),
         dropout=float(job["adapter_contract"]["dropout"]),
     )
-    starting_adapter = job.get("starting_adapter")
-    if starting_adapter:
-        weights = list(mx.load(starting_adapter).items())
-        model.load_weights(weights, strict=False)
-        reference.load_weights(weights, strict=False)
-    else:
-        reference.load_weights(list(tree_flatten(model.trainable_parameters())), strict=False)
+    starting_adapters = list(job.get("starting_adapters", []))
+    if job.get("starting_adapter"):
+        starting_adapters.insert(0, str(job["starting_adapter"]))
+    for adapter_path in starting_adapters:
+        model.load_weights(list(mx.load(adapter_path).items()), strict=False)
+    # The frozen reference must start from the exact composed policy, including
+    # freshly initialized socket values that are absent from an SFT checkpoint.
+    reference.load_weights(list(tree_flatten(model.trainable_parameters())), strict=False)
+    _freeze_candidate_entries(model, job["candidate"], set(job.get("frozen_entries", [])))
     reference.freeze()
     mx.eval(model.parameters(), reference.parameters())
     ppo_config = PPOConfig(**job["ppo"])
@@ -1432,9 +1696,15 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     summary["unhealthy"] = bool(summary["unhealthy"] or abort_reason)
     summary["kl_reference_kind"] = job.get("kl_reference_kind", "base_or_initial_policy")
     summary["kl_reference_adapter_sha256"] = (
-        _file_hash(Path(starting_adapter)) if starting_adapter else None
+        _file_hash(Path(starting_adapters[0])) if len(starting_adapters) == 1 else None
     )
+    summary["kl_reference_adapter_sha256s"] = [
+        _file_hash(Path(adapter_path)) for adapter_path in starting_adapters
+    ]
     summary["frozen_entries"] = list(job.get("frozen_entries", []))
+    summary["optimizer_trainable_parameters"] = sum(
+        int(value.size) for _, value in tree_flatten(model.trainable_parameters())
+    )
     summary["task_mix"] = dict(job.get("task_mix", {"arithmetic": 1, "python": 1}))
     summary["heldout_evaluation_curve"] = [
         {"update": row["update"], **row["heldout_behavior"]}
@@ -1470,8 +1740,11 @@ def _run_candidate_subprocess(
     *,
     method: str | None = None,
     starting_adapter: str | None = None,
+    starting_adapters: Sequence[str] | None = None,
     job_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if starting_adapter and starting_adapters:
+        raise ValueError("provide starting_adapter or starting_adapters, not both")
     config = _read_json(config_path)
     job = {
         "schema": f"{SCHEMA}.job.v1",
@@ -1484,6 +1757,7 @@ def _run_candidate_subprocess(
         "stage": stage,
         "method": method or candidate["arm"],
         "starting_adapter": starting_adapter,
+        "starting_adapters": list(starting_adapters or []),
         "rollout": config["rollout"],
         "evaluation": {
             **config["evaluation"],
@@ -2140,6 +2414,12 @@ def _checkpoint_job(
     config_lock = {
         "model": job["model_path"],
         "socket_hash": job["candidate"]["socket_hash"],
+        "starting_adapter_sha256s": [
+            _file_hash(Path(path))
+            for path in ([job["starting_adapter"]] if job.get("starting_adapter") else [])
+            + list(job.get("starting_adapters", []))
+        ],
+        "frozen_entries": list(job.get("frozen_entries", [])),
         "quantization": "QLoRA RL with frozen 4-bit base",
         "lora": job["adapter_contract"],
         "optimizer": {"constructor": "mlx.optimizers.AdamW", **job["optimizer"], "learning_rate": job["ppo"]["learning_rate"], "weight_decay": job["ppo"]["weight_decay"]},
@@ -2266,6 +2546,42 @@ def _clone_socket(socket: Mapping[str, Any], identifier: str) -> dict[str, Any]:
     return _rehash_socket(clone)
 
 
+def _compose_sockets(
+    identifier: str,
+    frozen_socket: Mapping[str, Any],
+    trainable_socket: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        frozen_socket["model_id"] != trainable_socket["model_id"]
+        or frozen_socket["model_revision"] != trainable_socket["model_revision"]
+    ):
+        raise ValueError("composite sockets must target the same model revision")
+    entries = [dict(entry) for entry in frozen_socket["entries"] + trainable_socket["entries"]]
+    keys = [(int(entry["layer"]), str(entry["family"])) for entry in entries]
+    if len(keys) != len(set(keys)):
+        raise ValueError("composite sockets may not overlap layer-family entries")
+    entries.sort(key=lambda item: (int(item["layer"]), str(item["family"])))
+    body = {
+        "schema": frozen_socket["schema"],
+        "socket_id": identifier,
+        "model_id": frozen_socket["model_id"],
+        "model_revision": frozen_socket["model_revision"],
+        "generation": "composite:frozen-sft-plus-fresh-rl",
+        "entries": entries,
+        "trainable_parameters": (
+            int(frozen_socket["trainable_parameters"])
+            + int(trainable_socket["trainable_parameters"])
+        ),
+        "component_sockets": {
+            "frozen_sft": frozen_socket["socket_hash"],
+            "fresh_rl": trainable_socket["socket_hash"],
+        },
+        "frozen_sft_parameters": int(frozen_socket["trainable_parameters"]),
+        "incremental_rl_parameters": int(trainable_socket["trainable_parameters"]),
+    }
+    return {**body, "socket_hash": _hash(body)}
+
+
 def _tag_topology(socket: Mapping[str, Any], *, arm: str) -> dict[str, Any]:
     tagged = dict(socket)
     tagged["arm"] = arm
@@ -2299,6 +2615,24 @@ def gradient_norms_by_entry(gradients: Any, candidate: Mapping[str, Any]) -> dic
         if key is not None:
             squared[key] += float(mx.sum(value.astype(mx.float32) ** 2))
     return {key: math.sqrt(value) for key, value in squared.items()}
+
+
+def _freeze_candidate_entries(
+    model: nn.Module,
+    candidate: Mapping[str, Any],
+    frozen_entries: set[str],
+) -> None:
+    """Remove frozen LoRA entries from autograd and optimizer state."""
+    for entry in candidate["entries"]:
+        if entry_key(entry) not in frozen_entries:
+            continue
+        layer = model.model.layers[int(entry["layer"])]
+        modules = dict(layer.named_modules())
+        for module_name in FAMILY_MODULES[str(entry["family"])]:
+            module = modules.get(module_name)
+            if module is None:
+                raise ValueError(f"candidate entry lacks module {module_name}")
+            module.freeze()
 
 
 def mask_frozen_entry_gradients(
@@ -2514,6 +2848,9 @@ def main() -> None:
     placement = subparsers.add_parser("placement-confirmation")
     placement.add_argument("--config", required=True, type=Path)
     placement.add_argument("--run", required=True, type=Path)
+    composite = subparsers.add_parser("composite-socket-test")
+    composite.add_argument("--config", required=True, type=Path)
+    composite.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -2531,6 +2868,8 @@ def main() -> None:
         result = run_uniform_kl_sweep(args.config, args.run)
     elif args.command == "placement-confirmation":
         result = run_placement_confirmation(args.config, args.run)
+    elif args.command == "composite-socket-test":
+        result = run_composite_socket_test(args.config, args.run)
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))
