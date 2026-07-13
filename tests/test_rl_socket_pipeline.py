@@ -130,6 +130,15 @@ def test_health_abort_requires_sustained_failure() -> None:
     history.append({"kl_divergence": 0.5, "zero_variance_group": 0.0, "completion_diversity": 1.0})
     assert _health_abort_reason(history, health).startswith("KL exceeded")
 
+    health["kl_abort_window"] = 4
+    spiky = [
+        {"kl_divergence": value, "zero_variance_group": 0.0, "completion_diversity": 1.0}
+        for value in (0.05, 0.5, 0.05, 0.05)
+    ]
+    assert _health_abort_reason(spiky, health) is None
+    spiky[-1]["kl_divergence"] = 0.4
+    assert _health_abort_reason(spiky, health).startswith("mean KL exceeded")
+
 
 def test_joint_sft_curriculum_covers_python_families_in_every_split(tmp_path) -> None:
     manifest = prepare_joint_sft_curriculum(tmp_path)

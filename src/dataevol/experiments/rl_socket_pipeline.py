@@ -1739,12 +1739,20 @@ def _is_unhealthy(metrics: Mapping[str, Any], health: Mapping[str, Any]) -> bool
 
 
 def _health_abort_reason(history: Sequence[Mapping[str, Any]], health: Mapping[str, Any]) -> str | None:
-    kl_window = int(health.get("kl_abort_consecutive", 3))
-    if len(history) >= kl_window and all(
-        row["kl_divergence"] > float(health["kl_threshold"])
-        for row in history[-kl_window:]
-    ):
-        return f"KL exceeded {health['kl_threshold']} for {kl_window} consecutive updates"
+    configured_kl_window = health.get("kl_abort_window")
+    if configured_kl_window is not None:
+        kl_window = int(configured_kl_window)
+        if len(history) >= kl_window and np.mean(
+            [row["kl_divergence"] for row in history[-kl_window:]]
+        ) > float(health["kl_threshold"]):
+            return f"mean KL exceeded {health['kl_threshold']} over {kl_window} updates"
+    else:
+        kl_window = int(health.get("kl_abort_consecutive", 3))
+        if len(history) >= kl_window and all(
+            row["kl_divergence"] > float(health["kl_threshold"])
+            for row in history[-kl_window:]
+        ):
+            return f"KL exceeded {health['kl_threshold']} for {kl_window} consecutive updates"
     variance_window = int(health.get("zero_variance_window", 20))
     if len(history) >= variance_window and np.mean(
         [row["zero_variance_group"] for row in history[-variance_window:]]

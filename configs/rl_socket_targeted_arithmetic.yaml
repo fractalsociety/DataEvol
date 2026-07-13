@@ -1,6 +1,6 @@
 {
   "schema": "dataevol.rl_socket_v2.config.v1",
-  "run_id": "rl-socket-targeted-arithmetic-v1b",
+  "run_id": "rl-socket-targeted-arithmetic-v1c",
   "model": {
     "id": "mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit",
     "path": ".dataevol/models/tinyllama-1.1b-chat-4bit",
@@ -69,6 +69,7 @@
     "diversity_window": 10,
     "diversity_abort_threshold": 0.05,
     "kl_threshold": 0.20,
+    "kl_abort_window": 20,
     "kl_abort_consecutive": 3,
     "kl_beta_growth": 2.0,
     "kl_beta_max": 2.0,
