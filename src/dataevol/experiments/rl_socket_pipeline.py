@@ -42,6 +42,11 @@ from dataevol.experiments.reusable_lora_socket import (
     prepare_datasets,
     train_socket_expert,
 )
+from dataevol.experiments.layerscope_depth_policy import (
+    classify_depth_profile,
+    cost_adjusted_entry_scores,
+    select_cost_aware_entries,
+)
 from dataevol.experiments.rl_socket_trainer import (
     PPOConfig,
     StatefulSampler,
@@ -945,6 +950,7 @@ def run_dynamic_socket_test(config_path: str | Path, run_dir: str | Path) -> dic
         "proxy_reward_window": int(experiment["proxy_reward_window"]),
         "proxy_minimum_reward_gain": float(experiment["proxy_minimum_reward_gain"]),
         "proxy_widen_parameters": int(experiment["proxy_widen_parameters"]),
+        **dict(experiment.get("depth_cost_policy", {})),
     }
     methods = {
         "dynamic_scheduled_socket": {
@@ -1079,6 +1085,7 @@ def run_warm_start_dynamic_socket_test(
         "proxy_minimum_reward_gain": float(experiment["proxy_minimum_reward_gain"]),
         "proxy_widen_parameters": 0,
         "activation_lr_warmup_updates": int(schedule.get("activation_lr_warmup_updates", 0)),
+        **dict(experiment.get("depth_cost_policy", {})),
     }
     results = [
         _run_candidate_subprocess(
@@ -1123,6 +1130,302 @@ def run_warm_start_dynamic_socket_test(
         bootstrap_draws=int(config["confirmation"]["bootstrap_draws"]),
     )
     _write_atomic_json(root / "warm_start_dynamic_socket_result.json", report)
+    _write_atomic_json(root / "latest_result.json", report)
+    return report
+
+
+def _calibration_probe_socket(*, excluded_layers: set[int]) -> dict[str, Any]:
+    return _raw_socket(
+        "calibration-depth-probe",
+        [
+            {"layer": layer, "family": "B", "rank": 4}
+            for layer in range(22)
+            if layer not in excluded_layers
+        ],
+        "rank-4-all-depth-calibration-probe",
+    )
+
+
+def _aggressive_socket_from_profile(
+    profile: Mapping[str, Any],
+    *,
+    target_parameters: int,
+) -> dict[str, Any]:
+    norms = profile["gradient_norms"]["calibration"]
+    counts = {key: FAMILY_PARAMS_PER_RANK["B"] * 4 for key in norms}
+    scores = cost_adjusted_entry_scores(norms, counts, num_layers=22)
+    layers = []
+    for key in sorted(scores, key=lambda item: (-float(scores[item]["cost_adjusted_score"]), item)):
+        layer = int(scores[key]["layer"])
+        if layer not in layers:
+            layers.append(layer)
+        if len(layers) == 2:
+            break
+    if len(layers) != 2:
+        raise ValueError("calibration probe must identify at least two distinct layers")
+    per_layer_rank_cost = sum(FAMILY_PARAMS_PER_RANK.values()) * len(layers)
+    rank = round(target_parameters / per_layer_rank_cost)
+    return _raw_socket(
+        "calibration-cost-aware-socket",
+        [
+            {"layer": layer, "family": family, "rank": rank}
+            for layer in layers
+            for family in FAMILY_MODULES
+        ],
+        "depth-cost-selected-aggressive-socket",
+    )
+
+
+def _task_between_interval(
+    left: Sequence[Mapping[str, Any]],
+    right: Sequence[Mapping[str, Any]],
+    *,
+    task: str,
+    draws: int,
+) -> dict[str, float]:
+    count = min(len(left), len(right))
+    differences = np.concatenate([
+        np.asarray(left[index]["behavior"][task]["outcomes"], dtype=float)
+        - np.asarray(right[index]["behavior"][task]["outcomes"], dtype=float)
+        for index in range(count)
+    ])
+    rng = np.random.default_rng(19421)
+    bootstrap = np.mean(
+        rng.choice(differences, size=(draws, len(differences)), replace=True), axis=1
+    )
+    return {
+        "mean_difference": float(np.mean(differences)),
+        "lower": float(np.quantile(bootstrap, 0.025)),
+        "upper": float(np.quantile(bootstrap, 0.975)),
+    }
+
+
+def run_calibration_depth_policy_test(
+    config_path: str | Path,
+    run_dir: str | Path,
+) -> dict[str, Any]:
+    """Test the depth classifier on a held-out selective-calibration task."""
+    config_path = Path(config_path)
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    config = _read_json(config_path)
+    _validate_config(config)
+    audit = run_correctness_audit(root, config_path)
+    if audit["verdict"] != "ELIGIBLE":
+        raise RuntimeError("calibration depth test requires an ELIGIBLE trainer audit")
+    experiment = config["calibration_depth_policy"]
+    prepare_calibration_curriculum(root)
+
+    from mlx_lm import load
+
+    base_model, tokenizer = load(config["model"]["path"])
+    frozen = {
+        split: _evaluate_candidate(
+            base_model,
+            tokenizer,
+            root / "datasets",
+            limit=int(config["evaluation"]["limit"]),
+            split=split,
+            tasks=("calibration",),
+        )
+        for split in ("valid", "test")
+    }
+    del base_model
+    mx.clear_cache()
+
+    target = int(config["adapter"]["target_parameters"])
+    source = Path(experiment["single_layer_source_run"])
+    sft_socket = parameter_matched_single(2, target, socket_id="calibration-sft-layer-2")
+    sft_adapter = source / "topology_sft/single-2/adapters.safetensors"
+    sft_baseline = _evaluate_adapter_stack(
+        config, root, sft_socket, [sft_adapter], tasks=("calibration",)
+    )
+    frozen_report = {
+        "valid": sft_baseline["valid"],
+        "test": sft_baseline["test"],
+        "frozen_base": frozen,
+        "sft_baseline": sft_baseline,
+    }
+    _write_atomic_json(root / "frozen_base_behavior.json", frozen_report)
+    low, high = (float(value) for value in experiment["required_start_accuracy_band"])
+    starting_accuracy = float(sft_baseline["test"]["calibration"]["accuracy"])
+    if not low <= starting_accuracy <= high:
+        body = {
+            "schema": f"{SCHEMA}.calibration_depth_result.v1",
+            "audit_hash": audit["audit_hash"],
+            "starting_accuracy": starting_accuracy,
+            "required_start_accuracy_band": [low, high],
+            "verdict": "INELIGIBLE_START_ACCURACY",
+            "completed_at": utc_now(),
+        }
+        report = {**body, "result_hash": _hash(body)}
+        _write_atomic_json(root / "calibration_depth_result.json", report)
+        _write_atomic_json(root / "latest_result.json", report)
+        return report
+
+    probe = _calibration_probe_socket(excluded_layers={2})
+    probe_candidate = _compose_sockets("calibration-sft-plus-probe", sft_socket, probe)
+    prior_entries = [entry_key(entry) for entry in sft_socket["entries"]]
+    profile = profile_entry_gradients(
+        config,
+        root,
+        probe_candidate,
+        sft_adapter,
+        limit=int(experiment["probe_examples"]),
+        tasks=("calibration",),
+        frozen_entries=prior_entries,
+    )
+    depth_decision = profile["depth_policy"]["calibration"]
+    if depth_decision["profile"] != "late_concentrated":
+        body = {
+            "schema": f"{SCHEMA}.calibration_depth_result.v1",
+            "audit_hash": audit["audit_hash"],
+            "task": "confidence_gate_calibration",
+            "starting_accuracy": starting_accuracy,
+            "depth_probe": profile,
+            "depth_decision": depth_decision,
+            "training_skipped": True,
+            "skip_reason": "aggressive sockets require a late-concentrated preflight profile",
+            "recommended_route": depth_decision["route"],
+            "verdict": "CALIBRATION_NOT_LATE_CONCENTRATED",
+            "completed_at": utc_now(),
+        }
+        report = {**body, "result_hash": _hash(body)}
+        _write_atomic_json(root / "calibration_depth_result.json", report)
+        _write_atomic_json(root / "latest_result.json", report)
+        return report
+    socket = _aggressive_socket_from_profile(profile, target_parameters=target)
+    uniform = parameter_matched_uniform(target)
+    direct = sft_socket
+    socket_composite = _compose_sockets("calibration-sft-plus-cost-aware", sft_socket, socket)
+    uniform_composite = _compose_sockets("calibration-sft-plus-uniform", sft_socket, uniform)
+    _assert_placement_parameter_contract(
+        {"cost_aware_socket": socket, "uniform": uniform, "direct": direct},
+        target,
+        float(config["adapter"]["maximum_parameter_mismatch"]),
+    )
+
+    candidates = {
+        "cost_aware_socket": (socket_composite, prior_entries),
+        "uniform_lora": (uniform_composite, prior_entries),
+        "direct_layer": (direct, []),
+    }
+    initial = {
+        method: _evaluate_adapter_stack(
+            config, root, candidate, [sft_adapter], tasks=("calibration",)
+        )
+        for method, (candidate, _) in candidates.items()
+    }
+    expected_outcomes = sft_baseline["test"]["calibration"]["outcomes"]
+    if any(row["test"]["calibration"]["outcomes"] != expected_outcomes for row in initial.values()):
+        raise RuntimeError("calibration methods do not share the same initial policy")
+
+    schedule = experiment["schedule"]
+    ppo = {
+        **config["ppo"],
+        "learning_rate": float(schedule["learning_rate"]),
+        "beta": float(schedule["beta"]),
+        "max_grad_norm": float(schedule["max_grad_norm"]),
+    }
+    health = {**config["health"], "kl_beta_max": float(schedule["kl_beta_max"])}
+    rollout = {
+        **config["rollout"],
+        "max_completion_tokens_by_task": {
+            **config["rollout"].get("max_completion_tokens_by_task", {}),
+            "calibration": int(experiment["max_completion_tokens"]),
+        },
+    }
+    results: dict[str, list[dict[str, Any]]] = {}
+    for method, (candidate, frozen_entries) in candidates.items():
+        results[method] = [
+            _run_candidate_subprocess(
+                config_path,
+                root,
+                candidate,
+                int(seed),
+                int(experiment["updates"]),
+                "confirmation-calibration-depth",
+                method=method,
+                starting_adapters=[str(sft_adapter.resolve())],
+                job_overrides={
+                    "task_mix": {"calibration": 1},
+                    "evaluation_tasks": ["calibration"],
+                    "frozen_entries": frozen_entries,
+                    "rollout": rollout,
+                    "evaluation_every": int(experiment["evaluation_every"]),
+                    "monitoring_split": "valid",
+                    "kl_reference_kind": "calibration_sft_checkpoint",
+                    "ppo": ppo,
+                    "health": health,
+                },
+            )
+            for seed in experiment["seeds"]
+        ]
+
+    methods: dict[str, Any] = {}
+    baseline = starting_accuracy
+    for method, rows in results.items():
+        accuracies = [float(row["behavior"]["calibration"]["accuracy"]) for row in rows]
+        methods[method] = {
+            "accuracy_by_seed": accuracies,
+            "mean_accuracy": float(np.mean(accuracies)),
+            "gain": float(np.mean(accuracies)) - baseline,
+            "wall_clock_seconds_by_seed": [float(row["wall_clock_seconds"]) for row in rows],
+            "mean_wall_clock_seconds": float(np.mean([row["wall_clock_seconds"] for row in rows])),
+            "peak_memory_bytes": max(int(row["peak_memory_bytes"]) for row in rows),
+            "healthy": all(not row["unhealthy"] and not row["aborted_early"] for row in rows),
+            "optimizer_trainable_parameters": [int(row["optimizer_trainable_parameters"]) for row in rows],
+        }
+    best_baseline = max(("uniform_lora", "direct_layer"), key=lambda name: methods[name]["gain"])
+    best_gain = float(methods[best_baseline]["gain"])
+    socket_gain = float(methods["cost_aware_socket"]["gain"])
+    recovery = socket_gain / best_gain if best_gain > 0 else None
+    interval = _task_between_interval(
+        results["cost_aware_socket"],
+        results[best_baseline],
+        task="calibration",
+        draws=int(config["confirmation"]["bootstrap_draws"]),
+    )
+    wall_savings = 1.0 - (
+        methods["cost_aware_socket"]["mean_wall_clock_seconds"]
+        / methods["uniform_lora"]["mean_wall_clock_seconds"]
+    )
+    late_predicted = depth_decision["profile"] == "late_concentrated"
+    quality_met = recovery is not None and recovery >= float(experiment["gain_recovery_target"])
+    supported = (
+        late_predicted
+        and quality_met
+        and interval["lower"] >= -(1.0 - float(experiment["gain_recovery_target"])) * best_gain
+        and wall_savings > 0
+        and methods["cost_aware_socket"]["healthy"]
+    )
+    verdict = (
+        "SOCKET_SWEET_SPOT_CONFIRMED"
+        if supported
+        else "CALIBRATION_NOT_LATE_CONCENTRATED"
+        if not late_predicted
+        else "SOCKET_SWEET_SPOT_REJECTED"
+    )
+    body = {
+        "schema": f"{SCHEMA}.calibration_depth_result.v1",
+        "audit_hash": audit["audit_hash"],
+        "task": "confidence_gate_calibration",
+        "starting_accuracy": starting_accuracy,
+        "depth_probe": profile,
+        "depth_decision": depth_decision,
+        "cost_aware_socket": socket,
+        "methods": methods,
+        "best_quality_baseline": best_baseline,
+        "gain_recovery_target": float(experiment["gain_recovery_target"]),
+        "gain_recovery_fraction": recovery,
+        "socket_minus_best_interval": interval,
+        "wall_clock_savings_vs_uniform": wall_savings,
+        "quality_target_met": quality_met,
+        "verdict": verdict,
+        "completed_at": utc_now(),
+    }
+    report = {**body, "result_hash": _hash(body)}
+    _write_atomic_json(root / "calibration_depth_result.json", report)
     _write_atomic_json(root / "latest_result.json", report)
     return report
 
@@ -1329,6 +1632,48 @@ def prepare_composite_socket_curriculum(root: str | Path, source: str | Path) ->
     return report
 
 
+def prepare_calibration_curriculum(root: str | Path) -> dict[str, Any]:
+    """Build a locked confidence-gating task for calibration-phase RL."""
+    root = Path(root)
+    manifest_path = root / "datasets/calibration_manifest.json"
+    if manifest_path.is_file():
+        return _read_json(manifest_path)
+    sizes = {"train": 2_000, "valid": 300, "test": 500}
+    prompts = {
+        "train": "The evidence is {status}. Should the agent claim confidence? Reply YES for VERIFIED and NO for UNVERIFIED.",
+        "valid": "The evidence status is {status}. Should the agent claim confidence? Reply YES for VERIFIED and NO for UNVERIFIED.",
+        "test": "The evidence is {status}. Should confidence be claimed? Reply YES for VERIFIED and NO for UNVERIFIED.",
+    }
+    splits: dict[str, Any] = {}
+    for split, count in sizes.items():
+        rng = random.Random(f"layerscope-calibration-v1:{split}:19421")
+        rows = []
+        for index in range(count):
+            verified = index % 2 == 0
+            status = "VERIFIED" if verified else "UNVERIFIED"
+            completion = "YES" if verified else "NO"
+            family = "calibration_verified" if verified else "calibration_unverified"
+            rows.append({
+                "id": f"calibration-{split}-{index:04d}",
+                "family": family,
+                "prompt": prompts[split].format(status=status),
+                "completion": completion,
+                "answer": completion,
+            })
+        path = root / f"datasets/calibration/{split}.jsonl"
+        _write_atomic_jsonl(path, rows)
+        splits[split] = {"rows": count, "sha256": _file_hash(path)}
+    body = {
+        "schema": f"{SCHEMA}.calibration_curriculum.v1",
+        "task": "confidence_gate",
+        "verified_fraction": 0.5,
+        "splits": splits,
+    }
+    report = {**body, "manifest_hash": _hash(body)}
+    _write_atomic_json(manifest_path, report)
+    return report
+
+
 def _assert_placement_parameter_contract(
     candidates: Mapping[str, Mapping[str, Any]],
     target: int,
@@ -1354,6 +1699,8 @@ def _evaluate_adapter_stack(
     root: Path,
     candidate: Mapping[str, Any],
     adapter_paths: Sequence[Path],
+    *,
+    tasks: Sequence[str] = ("arithmetic", "python"),
 ) -> dict[str, Any]:
     from mlx_lm import load
 
@@ -1374,6 +1721,7 @@ def _evaluate_adapter_stack(
             root / "datasets",
             limit=int(config["evaluation"]["limit"]),
             split=split,
+            tasks=tasks,
         )
         for split in ("valid", "test")
     }
@@ -1383,9 +1731,11 @@ def profile_entry_gradients(
     config: Mapping[str, Any],
     root: Path,
     candidate: Mapping[str, Any],
-    adapter_path: Path,
+    adapter_path: Path | None,
     *,
     limit: int,
+    tasks: Sequence[str] = ("arithmetic", "python"),
+    frozen_entries: Sequence[str] = (),
 ) -> dict[str, Any]:
     from mlx_lm import load
 
@@ -1399,9 +1749,15 @@ def profile_entry_gradients(
         scale=float(config["adapter"]["lora_scale"]),
         dropout=float(config["adapter"]["dropout"]),
     )
-    model.load_weights(list(mx.load(str(adapter_path)).items()), strict=False)
-    totals = {task: {entry_key(entry): 0.0 for entry in candidate["entries"]} for task in ("arithmetic", "python")}
-    for task in ("arithmetic", "python"):
+    if adapter_path is not None:
+        model.load_weights(list(mx.load(str(adapter_path)).items()), strict=False)
+    _freeze_candidate_entries(model, candidate, set(frozen_entries))
+    profiled_keys = [
+        entry_key(entry) for entry in candidate["entries"]
+        if entry_key(entry) not in set(frozen_entries)
+    ]
+    totals = {task: {key: 0.0 for key in profiled_keys} for task in tasks}
+    for task in tasks:
         rows = _read_jsonl(root / f"datasets/{task}/valid.jsonl")[:limit]
         for row in rows:
             prompt = _prompt_tokens(tokenizer, row["prompt"])
@@ -1416,6 +1772,8 @@ def profile_entry_gradients(
             norms = gradient_norms_by_entry(gradients, candidate)
             mx.eval(*[value for _, value in tree_flatten(gradients)])
             for key, value in norms.items():
+                if key not in totals[task]:
+                    continue
                 totals[task][key] += value / max(1, len(rows))
     body = {
         "schema": f"{SCHEMA}.entry_gradient_profile.v1",
@@ -1423,6 +1781,10 @@ def profile_entry_gradients(
         "socket_hash": candidate["socket_hash"],
         "examples_per_task": limit,
         "gradient_norms": totals,
+        "depth_policy": {
+            task: classify_depth_profile(values, num_layers=22)
+            for task, values in totals.items()
+        },
     }
     report = {**body, "profile_hash": _hash(body)}
     _write_atomic_json(report_path, report)
@@ -1955,6 +2317,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     dynamic_budget = int(dynamic_config["initial_parameter_budget"]) if dynamic_config else 0
     force_reprobe = bool(dynamic_config and dynamic_config.get("reprobe_on_first_update", True))
     entry_activation_updates = {key: 0 for key in active_entries}
+    latest_depth_policy: dict[str, Any] | None = None
     latest = _latest_checkpoint(candidate_dir / "checkpoints")
     if latest:
         loaded = load_checkpoint(latest, model=model, optimizer=optimizer, sampler=sampler)
@@ -1977,19 +2340,22 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                     "entry_activation_updates", entry_activation_updates
                 ).items()
             }
+            latest_depth_policy = health_history[-1].get("layerscope_depth_policy")
     data_root = root / "datasets"
-    datasets = {
-        task: _read_jsonl(data_root / task / "train.jsonl")
-        for task in ("arithmetic", "python")
-    }
-    started = time.perf_counter()
     task_schedule = [
         task
         for task, frequency in job.get("task_mix", {"arithmetic": 1, "python": 1}).items()
         for _ in range(int(frequency))
     ]
-    if not task_schedule or any(task not in datasets for task in task_schedule):
-        raise ValueError("task_mix must contain positive arithmetic/Python frequencies")
+    supported_tasks = {"arithmetic", "python", "calibration"}
+    if not task_schedule or any(task not in supported_tasks for task in task_schedule):
+        raise ValueError("task_mix contains an unsupported or nonpositive task frequency")
+    datasets = {
+        task: _read_jsonl(data_root / task / "train.jsonl")
+        for task in set(task_schedule)
+    }
+    started = time.perf_counter()
+    evaluation_tasks = tuple(job.get("evaluation_tasks", ("arithmetic", "python")))
     while update < int(job["target_update"]):
         task = task_schedule[update % len(task_schedule)]
         row = random.choice(datasets[task])
@@ -1999,7 +2365,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                 task, job["rollout"]["max_completion_tokens"]
             )
         )
-        stop_sequences = [[13]] if task == "arithmetic" else [[13, 13]]
+        stop_sequences = [[13]] if task in {"arithmetic", "calibration"} else [[13, 13]]
         completions = _batch_cached_completions(
             model,
             prompt_tokens,
@@ -2073,6 +2439,16 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                     key: float(np.mean([row.get(key, 0.0) for row in recent_norms]))
                     for key in current_entry_norms
                 }
+                latest_depth_policy = classify_depth_profile(
+                    averaged_norms,
+                    num_layers=int(dynamic_config.get("num_layers", 22)),
+                    concentration_threshold=float(
+                        dynamic_config.get("depth_concentration_threshold", 0.60)
+                    ),
+                    bimodal_lobe_threshold=float(
+                        dynamic_config.get("bimodal_lobe_threshold", 0.25)
+                    ),
+                )
                 previous_active_entries = set(active_entries)
                 active_entries = select_scheduled_socket_entries(
                     job["candidate"],
@@ -2081,6 +2457,11 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                     reserve_entries=set(dynamic_config["reserve_entries"]),
                     parameter_budget=dynamic_budget,
                     hysteresis_ratio=float(dynamic_config["hysteresis_ratio"]),
+                    num_layers=int(dynamic_config.get("num_layers", 22)),
+                    fixed_forward_fraction=float(
+                        dynamic_config.get("fixed_forward_cost_fraction", 0.5)
+                    ),
+                    depth_cost_weight=float(dynamic_config.get("depth_cost_weight", 1.0)),
                 )
                 for key in active_entries - previous_active_entries:
                     entry_activation_updates[key] = update
@@ -2162,6 +2543,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                 "socket_phase": dynamic_config["phase"],
                 "entry_activation_updates": dict(sorted(entry_activation_updates.items())),
                 "entry_step_scales": dict(sorted(entry_step_scales.items())),
+                "layerscope_depth_policy": latest_depth_policy,
             })
         if health["kl_divergence"] > float(job["health"]["kl_threshold"]):
             current_beta = min(
@@ -2183,12 +2565,14 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                 data_root,
                 limit=int(job["evaluation"]["limit"]),
                 split=str(job.get("monitoring_split", job["evaluation"]["split"])),
+                tasks=evaluation_tasks,
             )
             if dynamic_config and proxy_true_gap_detected(
                 health_history,
                 health,
                 reward_window=int(dynamic_config["proxy_reward_window"]),
                 minimum_reward_gain=float(dynamic_config["proxy_minimum_reward_gain"]),
+                task=str(dynamic_config.get("proxy_task", "arithmetic")),
             ):
                 previous_budget = dynamic_budget
                 dynamic_budget = min(
@@ -2222,6 +2606,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         data_root,
         limit=int(job["evaluation"]["limit"]),
         split=str(job["evaluation"]["split"]),
+        tasks=evaluation_tasks,
     )
     summary = _summarize_job(job, health_history, reward_history, generated_tokens, behavior, time.perf_counter() - started)
     summary["aborted_early"] = abort_reason is not None
@@ -2248,6 +2633,21 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             "final_active_entries": sorted(active_entries),
             "final_parameter_budget": dynamic_budget,
             "proxy_true_gap_events": sum(bool(row.get("proxy_true_gap_detected")) for row in mask_rows),
+            "final_depth_policy": next(
+                (
+                    row["layerscope_depth_policy"]
+                    for row in reversed(mask_rows)
+                    if row.get("layerscope_depth_policy") is not None
+                ),
+                None,
+            ),
+            "depth_cost_contract": {
+                "num_layers": int(dynamic_config.get("num_layers", 22)),
+                "fixed_forward_cost_fraction": float(
+                    dynamic_config.get("fixed_forward_cost_fraction", 0.5)
+                ),
+                "depth_cost_weight": float(dynamic_config.get("depth_cost_weight", 1.0)),
+            },
             "entry_active_fraction": {
                 key: float(np.mean([key in row["active_socket_entries"] for row in mask_rows]))
                 if mask_rows else 0.0
@@ -2772,16 +3172,40 @@ def _pad_rollouts(prompt: Sequence[int], completions: Sequence[Sequence[int]], p
 
 
 def _training_reward(task: str, output: str, row: Mapping[str, Any], length: int, hard_limit: int) -> float:
-    behavioral = (
-        _arithmetic_behavioral_reward(output, row["answer"])
-        if task == "arithmetic"
-        else _python_public_test_fraction(output, row["completion"])
-    )
+    if task == "arithmetic":
+        behavioral = _arithmetic_behavioral_reward(output, row["answer"])
+    elif task == "python":
+        behavioral = _python_public_test_fraction(output, row["completion"])
+    elif task == "calibration":
+        behavioral = float(_calibration_correct(output, row["answer"]))
+    else:
+        raise ValueError(f"unsupported RL task: {task}")
     if behavioral <= 0:
         return 0.0
-    format_bonus = 0.01 if (task == "arithmetic" and output.strip().lstrip("-").isdigit()) or (task == "python" and "def " in output) else 0.0
+    format_bonus = 0.01 if (
+        (task == "arithmetic" and output.strip().lstrip("-").isdigit())
+        or (task == "python" and "def " in output)
+        or (task == "calibration" and _normalized_calibration_output(output) is not None)
+    ) else 0.0
     length_bonus = 0.005 * max(0.0, 1.0 - length / max(1, hard_limit))
     return behavioral + min(0.01, format_bonus) + min(0.005, length_bonus)
+
+
+def _normalized_calibration_output(output: str) -> str | None:
+    stripped = output.strip()
+    labels = [label for label in ("YES", "NO") if re.search(rf"\b{label}\b", stripped, flags=re.IGNORECASE)]
+    if len(labels) == 1:
+        return labels[0]
+    if re.search(r"\bABSTAIN\b", stripped, flags=re.IGNORECASE):
+        return "ABSTAIN"
+    match = re.search(r"(?<![\d.])-?\d+(?![\d.])", stripped)
+    if match:
+        return match.group(0)
+    return None
+
+
+def _calibration_correct(output: str, expected: str) -> bool:
+    return _normalized_calibration_output(output) == str(expected)
 
 
 def _arithmetic_behavioral_reward(output: str, expected: str) -> float:
@@ -2858,23 +3282,40 @@ def _python_public_test_fraction(output: str, expected: str, *, hidden: bool = F
     return passed / len(selected)
 
 
-def _evaluate_candidate(model: nn.Module, tokenizer: Any, data_root: Path, *, limit: int, split: str) -> dict[str, Any]:
+def _evaluate_candidate(
+    model: nn.Module,
+    tokenizer: Any,
+    data_root: Path,
+    *,
+    limit: int,
+    split: str,
+    tasks: Sequence[str] = ("arithmetic", "python"),
+) -> dict[str, Any]:
     from mlx_lm import batch_generate
     from mlx_lm.sample_utils import make_sampler
 
     result: dict[str, Any] = {}
-    for task in ("arithmetic", "python"):
+    for task in tasks:
         rows = _read_jsonl(data_root / task / f"{split}.jsonl")[:limit]
         prompts = [_prompt_tokens(tokenizer, row["prompt"]) for row in rows]
-        response = batch_generate(model, tokenizer, prompts, max_tokens=64, sampler=make_sampler(temp=0.0), verbose=False)
-        outcomes = [
-            _arithmetic_correct(output, row["answer"])
-            if task == "arithmetic"
-            else _python_public_test_fraction(output, row["completion"], hidden=True) == 1.0
-            for output, row in zip(response.texts, rows)
-        ]
+        maximum = 12 if task == "calibration" else 64
+        response = batch_generate(model, tokenizer, prompts, max_tokens=maximum, sampler=make_sampler(temp=0.0), verbose=False)
+        if task == "arithmetic":
+            outcomes = [_arithmetic_correct(output, row["answer"]) for output, row in zip(response.texts, rows)]
+        elif task == "python":
+            outcomes = [
+                _python_public_test_fraction(output, row["completion"], hidden=True) == 1.0
+                for output, row in zip(response.texts, rows)
+            ]
+        elif task == "calibration":
+            outcomes = [_calibration_correct(output, row["answer"]) for output, row in zip(response.texts, rows)]
+        else:
+            raise ValueError(f"unsupported evaluation task: {task}")
         result[task] = {"accuracy": float(np.mean(outcomes)), "outcomes": outcomes, "rows": len(rows)}
-    result["behavioral_accuracy"] = 0.5625 * result["arithmetic"]["accuracy"] + 0.4375 * result["python"]["accuracy"]
+    if tuple(tasks) == ("arithmetic", "python"):
+        result["behavioral_accuracy"] = 0.5625 * result["arithmetic"]["accuracy"] + 0.4375 * result["python"]["accuracy"]
+    else:
+        result["behavioral_accuracy"] = float(np.mean([result[task]["accuracy"] for task in tasks]))
     return result
 
 
@@ -3224,28 +3665,23 @@ def select_scheduled_socket_entries(
     reserve_entries: set[str],
     parameter_budget: int,
     hysteresis_ratio: float,
+    num_layers: int = 22,
+    fixed_forward_fraction: float = 0.5,
+    depth_cost_weight: float = 1.0,
 ) -> set[str]:
-    """Select a budgeted socket mask using parameter-normalized saliency."""
+    """Select a mask using saliency density per estimated backward cost."""
     counts = _entry_parameter_counts(candidate)
-    missing = reserve_entries - set(counts)
-    if missing:
-        raise ValueError(f"reserve entries are absent from candidate: {sorted(missing)}")
-    selected = set(reserve_entries)
-    used = sum(counts[key] for key in selected)
-    if used > parameter_budget:
-        raise ValueError("reserve entries exceed the active parameter budget")
-    scored = []
-    for key, count in counts.items():
-        if key in reserve_entries:
-            continue
-        score = float(gradient_norms.get(key, 0.0)) / math.sqrt(max(1, count))
-        if key in current_entries:
-            score /= max(1e-6, hysteresis_ratio)
-        scored.append((score, key))
-    for _, key in sorted(scored, key=lambda item: (-item[0], item[1])):
-        if used + counts[key] <= parameter_budget:
-            selected.add(key)
-            used += counts[key]
+    selected, _ = select_cost_aware_entries(
+        gradient_norms,
+        counts,
+        current_entries=current_entries,
+        required_entries=reserve_entries,
+        parameter_budget=parameter_budget,
+        hysteresis_ratio=hysteresis_ratio,
+        num_layers=num_layers,
+        fixed_forward_fraction=fixed_forward_fraction,
+        depth_cost_weight=depth_cost_weight,
+    )
     return selected
 
 
@@ -3255,6 +3691,7 @@ def proxy_true_gap_detected(
     *,
     reward_window: int,
     minimum_reward_gain: float,
+    task: str = "arithmetic",
 ) -> bool:
     if "heldout_behavior" not in current:
         return False
@@ -3264,8 +3701,8 @@ def proxy_true_gap_detected(
     rewards = [float(row["mean_task_reward"]) for row in [*history, current]]
     previous_reward = float(np.mean(rewards[-2 * reward_window:-reward_window]))
     recent_reward = float(np.mean(rewards[-reward_window:]))
-    previous_accuracy = float(prior_evaluations[-1]["heldout_behavior"]["arithmetic"]["accuracy"])
-    current_accuracy = float(current["heldout_behavior"]["arithmetic"]["accuracy"])
+    previous_accuracy = float(prior_evaluations[-1]["heldout_behavior"][task]["accuracy"])
+    current_accuracy = float(current["heldout_behavior"][task]["accuracy"])
     return recent_reward >= previous_reward + minimum_reward_gain and current_accuracy <= previous_accuracy
 
 
@@ -3509,6 +3946,9 @@ def main() -> None:
     warm_ramp = subparsers.add_parser("warm-start-dynamic-socket-ramp-test")
     warm_ramp.add_argument("--config", required=True, type=Path)
     warm_ramp.add_argument("--run", required=True, type=Path)
+    calibration_depth = subparsers.add_parser("calibration-depth-policy-test")
+    calibration_depth.add_argument("--config", required=True, type=Path)
+    calibration_depth.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -3536,6 +3976,8 @@ def main() -> None:
         result = run_warm_start_dynamic_socket_test(
             args.config, args.run, schedule_key="socket_warmup_schedule"
         )
+    elif args.command == "calibration-depth-policy-test":
+        result = run_calibration_depth_policy_test(args.config, args.run)
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))

@@ -17,6 +17,9 @@ from dataevol.experiments.rl_socket_pipeline import (
     _arithmetic_between_interval,
     _arithmetic_paired_interval,
     _contiguous_socket,
+    _calibration_correct,
+    _calibration_probe_socket,
+    _aggressive_socket_from_profile,
     _compose_sockets,
     _freeze_candidate_entries,
     _health_abort_reason,
@@ -32,6 +35,7 @@ from dataevol.experiments.rl_socket_pipeline import (
     mask_frozen_entry_gradients,
     prepare_joint_sft_curriculum,
     prepare_composite_socket_curriculum,
+    prepare_calibration_curriculum,
     prepare_placement_confirmation_curriculum,
     prepare_targeted_arithmetic_curriculum,
     prepare_uniform_kl_sweep_curriculum,
@@ -121,6 +125,8 @@ def test_targeted_confirmation_budget_is_pinned_to_sixty_updates() -> None:
     assert config["warm_start_dynamic_socket"]["maximum_parameter_budget"] == 2_500_000
     assert config["warm_start_dynamic_socket"]["socket_warmup_schedule"]["beta"] == 0.4
     assert config["warm_start_dynamic_socket"]["socket_warmup_schedule"]["activation_lr_warmup_updates"] == 5
+    assert config["calibration_depth_policy"]["seeds"] == [43, 71]
+    assert config["calibration_depth_policy"]["gain_recovery_target"] == 0.95
     assert config["placement_confirmation"]["schedule"]["learning_rate"] == 5e-6
     assert [row["learning_rate"] for row in config["uniform_kl_sweep"]["schedules"]] == [1e-5, 5e-6, 2e-6]
 
@@ -136,6 +142,39 @@ def test_training_rewards_are_behavioral_and_shaping_is_gated() -> None:
     assert _python_public_test_fraction(correct, expected) == 1.0
     assert _python_public_test_fraction(partial, expected) == 0.5
     assert _training_reward("python", "not python", {"completion": expected}, 2, 48) == 0.0
+    assert _calibration_correct("YES", "YES")
+    assert _calibration_correct("The gate says NO.", "NO")
+    assert not _calibration_correct("YES or NO", "YES")
+    assert _training_reward("calibration", "NO", {"answer": "NO"}, 1, 12) > 1.0
+
+
+def test_calibration_curriculum_is_balanced_and_split_locked(tmp_path: Path) -> None:
+    manifest = prepare_calibration_curriculum(tmp_path)
+    train = [json.loads(line) for line in (tmp_path / "datasets/calibration/train.jsonl").read_text().splitlines()]
+
+    assert manifest["verified_fraction"] == 0.5
+    assert len(train) == 2_000
+    assert sum(row["answer"] == "NO" for row in train) == 1_000
+    assert manifest == prepare_calibration_curriculum(tmp_path)
+
+
+def test_calibration_probe_and_aggressive_socket_preserve_budget() -> None:
+    probe = _calibration_probe_socket(excluded_layers={2})
+    profile = {
+        "gradient_norms": {
+            "calibration": {
+                f"layer-{layer}:family-B": (10.0 if layer >= 19 else 0.1)
+                for layer in range(22)
+                if layer != 2
+            }
+        }
+    }
+
+    socket = _aggressive_socket_from_profile(profile, target_parameters=2_400_000)
+
+    assert all(entry["layer"] != 2 for entry in probe["entries"])
+    assert {entry["layer"] for entry in socket["entries"]} <= {19, 20, 21}
+    assert abs(socket["trainable_parameters"] - 2_400_000) / 2_400_000 <= 0.005
 
 
 def test_every_python_training_function_has_public_behavior_tests() -> None:

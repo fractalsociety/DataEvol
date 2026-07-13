@@ -171,6 +171,13 @@
     "proxy_reward_window": 10,
     "proxy_minimum_reward_gain": 0.01,
     "proxy_widen_parameters": 625000,
+    "depth_cost_policy": {
+      "num_layers": 22,
+      "fixed_forward_cost_fraction": 0.5,
+      "depth_cost_weight": 1.0,
+      "depth_concentration_threshold": 0.60,
+      "bimodal_lobe_threshold": 0.25
+    },
     "schedule": {
       "learning_rate": 0.000005,
       "beta": 0.4,
@@ -192,6 +199,13 @@
     "maximum_parameter_budget": 2500000,
     "proxy_reward_window": 10,
     "proxy_minimum_reward_gain": 0.01,
+    "depth_cost_policy": {
+      "num_layers": 22,
+      "fixed_forward_cost_fraction": 0.5,
+      "depth_cost_weight": 1.0,
+      "depth_concentration_threshold": 0.60,
+      "bimodal_lobe_threshold": 0.25
+    },
     "schedule": {
       "learning_rate": 0.000005,
       "beta": 0.4,
@@ -204,6 +218,22 @@
       "max_grad_norm": 0.5,
       "kl_beta_max": 4.0,
       "activation_lr_warmup_updates": 5
+    }
+  },
+  "calibration_depth_policy": {
+    "single_layer_source_run": ".dataevol/experiments/rl_socket_targeted_arithmetic_v1e",
+    "required_start_accuracy_band": [0.35, 0.65],
+    "probe_examples": 32,
+    "gain_recovery_target": 0.95,
+    "updates": 60,
+    "evaluation_every": 10,
+    "max_completion_tokens": 12,
+    "seeds": [43, 71],
+    "schedule": {
+      "learning_rate": 0.000005,
+      "beta": 0.4,
+      "max_grad_norm": 0.5,
+      "kl_beta_max": 4.0
     }
   },
   "checkpoint_every": 20,
