@@ -367,9 +367,20 @@ def run_sft_then_rl_test(config_path: str | Path, run_dir: str | Path) -> dict[s
         )
         for seed in config["search"]["seeds"]
     ]
-    fresh_control_root = Path(config["sft"]["fresh_control_run"])
+    fresh_candidate = _tag_topology(
+        _clone_socket(candidate, "guided-00-fresh-rl-control"),
+        arm="fresh_rl_control",
+    )
     fresh_results = [
-        _read_json(fresh_control_root / "jobs/guided-00" / f"seed-{seed}" / "latest_result.json")
+        _run_candidate_subprocess(
+            config_path,
+            root,
+            fresh_candidate,
+            int(seed),
+            int(config["confirmation"]["updates"]),
+            "sft-rl-test",
+            method="fresh_rl_control",
+        )
         for seed in config["search"]["seeds"]
     ]
     rl_summary = [{
