@@ -49,6 +49,14 @@
     "seed_stability_weight": 0.05,
     "efficiency_scale": 0.02
   },
+  "sft": {
+    "optimizer_steps": 1000,
+    "max_seq_length": 256,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "seed": 2201,
+    "fresh_control_run": ".dataevol/experiments/rl_socket_v2_1c_two_seed"
+  },
   "ppo": {
     "clip_epsilon": 0.2,
     "beta": 0.1,

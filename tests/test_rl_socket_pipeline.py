@@ -13,6 +13,7 @@ from dataevol.experiments.rl_socket_pipeline import (
     _training_reward,
     _validate_config,
     build_candidate_manifest,
+    prepare_joint_sft_curriculum,
 )
 
 
@@ -120,3 +121,16 @@ def test_health_abort_requires_sustained_failure() -> None:
     assert _health_abort_reason(history, health) is None
     history.append({"kl_divergence": 0.5, "zero_variance_group": 0.0, "completion_diversity": 1.0})
     assert _health_abort_reason(history, health).startswith("KL exceeded")
+
+
+def test_joint_sft_curriculum_covers_python_families_in_every_split(tmp_path) -> None:
+    manifest = prepare_joint_sft_curriculum(tmp_path)
+
+    assert manifest["python_function_families"] == 8
+    assert manifest["splits"]["train"]["rows"] == 4_000
+    assert manifest["splits"]["valid"]["rows"] == 600
+    assert manifest["splits"]["test"]["rows"] == 1_000
+    for split in ("train", "valid", "test"):
+        text = (tmp_path / f"datasets/python/{split}.jsonl").read_text()
+        for function in ("clamp", "is_even", "last_item", "add_tax", "contains", "square", "first_item", "subtract"):
+            assert f"def {function}" in text

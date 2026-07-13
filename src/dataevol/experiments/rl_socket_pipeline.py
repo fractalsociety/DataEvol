@@ -278,6 +278,179 @@ def run_two_seed_test(config_path: str | Path, run_dir: str | Path) -> dict[str,
     return report
 
 
+def run_sft_then_rl_test(config_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
+    config_path = Path(config_path)
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    audit = _read_json(root / "trainer_audit.json")
+    if audit["verdict"] != "ELIGIBLE" or audit["git_commit"] != _git_commit():
+        raise RuntimeError("SFT-to-RL test requires an ELIGIBLE audit for the current Git commit")
+    config = _read_json(config_path)
+    _validate_config(config)
+    prepare_joint_sft_curriculum(root)
+    manifest = build_candidate_manifest(config, root)
+    frozen = _evaluate_frozen_base(config, root)
+    candidate = next(row for row in manifest["candidates"] if row["socket_id"] == "guided-00")
+    sft_config = TrainConfig(
+        optimizer_steps=int(config["sft"]["optimizer_steps"]),
+        batch_size=1,
+        grad_accumulation=1,
+        max_seq_length=int(config["sft"]["max_seq_length"]),
+        learning_rate=float(config["sft"]["learning_rate"]),
+        weight_decay=float(config["sft"]["weight_decay"]),
+        lora_scale=float(config["adapter"]["lora_scale"]),
+        lora_dropout=float(config["adapter"]["dropout"]),
+    )
+    sft_dir = root / "joint_sft_adapter"
+    training = train_socket_expert(
+        model_path=config["model"]["path"],
+        socket=candidate,
+        data_dir=root / "joint_sft",
+        output_dir=sft_dir,
+        task="joint-arithmetic-python-sft",
+        config=sft_config,
+        seed=int(config["sft"]["seed"]),
+    )
+    from mlx_lm import load
+
+    sft_model, tokenizer = load(config["model"]["path"])
+    _apply_socket(
+        sft_model,
+        candidate,
+        scale=float(config["adapter"]["lora_scale"]),
+        dropout=float(config["adapter"]["dropout"]),
+    )
+    adapter_path = sft_dir / "adapters.safetensors"
+    sft_model.load_weights(list(mx.load(str(adapter_path)).items()), strict=False)
+    mx.eval(sft_model.parameters())
+    sft_behavior = _evaluate_candidate(
+        sft_model,
+        tokenizer,
+        root / "datasets",
+        limit=int(config["evaluation"]["limit"]),
+        split="valid",
+    )
+    task_gates = {
+        task: (
+            sft_behavior[task]["accuracy"] > frozen["valid"][task]["accuracy"]
+            and sft_behavior[task]["accuracy"] > 0
+        )
+        for task in ("arithmetic", "python")
+    }
+    sft_gate_passed = all(task_gates.values())
+    base_body = {
+        "schema": f"{SCHEMA}.sft_then_rl_test.v1",
+        "audit_hash": audit["audit_hash"],
+        "candidate": candidate,
+        "sft_training": training,
+        "sft_adapter_sha256": training["adapter_sha256"],
+        "frozen_behavior": frozen["valid"],
+        "sft_behavior": sft_behavior,
+        "sft_task_gates": task_gates,
+        "sft_gate_passed": sft_gate_passed,
+    }
+    if not sft_gate_passed:
+        report = {**base_body, "verdict": "SFT_REJECTED"}
+        report["test_hash"] = _hash(report)
+        _write_atomic_json(root / "sft_then_rl_result.json", report)
+        return report
+    rl_results = [
+        _run_candidate_subprocess(
+            config_path,
+            root,
+            candidate,
+            int(seed),
+            int(config["confirmation"]["updates"]),
+            "sft-rl-test",
+            method="sft_then_rl",
+            starting_adapter=str(adapter_path.resolve()),
+        )
+        for seed in config["search"]["seeds"]
+    ]
+    fresh_control_root = Path(config["sft"]["fresh_control_run"])
+    fresh_results = [
+        _read_json(fresh_control_root / "jobs/guided-00" / f"seed-{seed}" / "latest_result.json")
+        for seed in config["search"]["seeds"]
+    ]
+    rl_summary = [{
+        "seed": row["seed"],
+        "updates": row["updates"],
+        "behavioral_accuracy": row["behavioral_accuracy"],
+        "behavioral_improvement_over_frozen": row["behavioral_improvement"],
+        "increment_over_sft": row["behavioral_accuracy"] - sft_behavior["behavioral_accuracy"],
+        "fresh_rl_accuracy": fresh_results[index]["behavioral_accuracy"],
+        "increment_over_fresh_rl": row["behavioral_accuracy"] - fresh_results[index]["behavioral_accuracy"],
+        "kl_divergence": row["kl_divergence"],
+        "completion_diversity": row["completion_diversity"],
+        "zero_variance_group_fraction": row["zero_variance_group_fraction"],
+        "unhealthy": row["unhealthy"],
+        "aborted_early": row["aborted_early"],
+        "result_hash": row["result_hash"],
+    } for index, row in enumerate(rl_results)]
+    healthy = all(not row["unhealthy"] and not row["aborted_early"] for row in rl_summary)
+    h5_weight_continuation = float(np.mean([row["increment_over_sft"] for row in rl_summary])) > 0
+    beats_fresh_rl = float(np.mean([row["increment_over_fresh_rl"] for row in rl_summary])) > 0
+    verdict = "ELIGIBLE_FOR_BROADER_SEARCH" if healthy and h5_weight_continuation and beats_fresh_rl else "SFT_VALID_RL_NOT_PROVEN"
+    body = {
+        **base_body,
+        "rl_results": rl_summary,
+        "healthy": healthy,
+        "h5_weight_continuation_supported": h5_weight_continuation,
+        "beats_fresh_rl": beats_fresh_rl,
+        "verdict": verdict,
+        "completed_at": utc_now(),
+    }
+    report = {**body, "test_hash": _hash(body)}
+    _write_atomic_json(root / "sft_then_rl_result.json", report)
+    _write_atomic_json(root / "latest_result.json", report)
+    return report
+
+
+def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
+    root = Path(root)
+    prepare_datasets(root / "datasets")
+    python_variants = [
+        ("def clamp(x, low, high):\n    return min(low, max(x, high))", "def clamp(x, low, high):\n    return max(low, min(x, high))"),
+        ("def is_even(n):\n    return n % 2 == 1", "def is_even(n):\n    return n % 2 == 0"),
+        ("def last_item(items):\n    return items[0]", "def last_item(items):\n    return items[-1]"),
+        ("def add_tax(price, rate):\n    return price - price * rate", "def add_tax(price, rate):\n    return price + price * rate"),
+        ("def contains(items, value):\n    return value not in items", "def contains(items, value):\n    return value in items"),
+        ("def square(n):\n    return n + n", "def square(n):\n    return n * n"),
+        ("def first_item(items):\n    return items[-1]", "def first_item(items):\n    return items[0]"),
+        ("def subtract(a, b):\n    return b - a", "def subtract(a, b):\n    return a - b"),
+    ]
+    sizes = {"train": 2_000, "valid": 300, "test": 500}
+    prompt_prefixes = {
+        "train": "Repair the localized bug. Return only the corrected Python function.",
+        "valid": "Fix this function. Output only executable corrected code.",
+        "test": "Correct the behavior while preserving the function signature. Return code only.",
+    }
+    for split, count in sizes.items():
+        rows = []
+        for index in range(count):
+            buggy, fixed = python_variants[index % len(python_variants)]
+            rows.append({
+                "id": f"python-{split}-{index:04d}",
+                "prompt": f"{prompt_prefixes[split]} Case {split}-{1000 + index}.\n```python\n{buggy}\n```",
+                "completion": fixed,
+            })
+        _write_atomic_jsonl(root / f"datasets/python/{split}.jsonl", rows)
+    joint = root / "joint_sft"
+    manifest: dict[str, Any] = {"schema": f"{SCHEMA}.joint_sft_curriculum.v1", "splits": {}}
+    for split in sizes:
+        arithmetic = _read_jsonl(root / f"datasets/arithmetic/{split}.jsonl")
+        python = _read_jsonl(root / f"datasets/python/{split}.jsonl")
+        rows = arithmetic + python
+        random.Random(f"joint-sft:{split}:2201").shuffle(rows)
+        path = joint / f"{split}.jsonl"
+        _write_atomic_jsonl(path, rows)
+        manifest["splits"][split] = {"rows": len(rows), "sha256": _file_hash(path)}
+    manifest["python_function_families"] = len(python_variants)
+    manifest["manifest_hash"] = _hash(manifest)
+    _write_atomic_json(joint / "manifest.json", manifest)
+    return manifest
+
+
 def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     global TERMINATE_REQUESTED
     job = _read_json(Path(job_path))
@@ -1438,6 +1611,16 @@ def _write_atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _write_atomic_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        "".join(json.dumps(dict(row), sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the audited RL socket v2 experiment")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1451,6 +1634,9 @@ def main() -> None:
     two_seed = subparsers.add_parser("two-seed-test")
     two_seed.add_argument("--config", required=True, type=Path)
     two_seed.add_argument("--run", required=True, type=Path)
+    sft_rl = subparsers.add_parser("sft-then-rl-test")
+    sft_rl.add_argument("--config", required=True, type=Path)
+    sft_rl.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -1460,6 +1646,8 @@ def main() -> None:
         result = train_candidate_job(args.job)
     elif args.command == "two-seed-test":
         result = run_two_seed_test(args.config, args.run)
+    elif args.command == "sft-then-rl-test":
+        result = run_sft_then_rl_test(args.config, args.run)
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))

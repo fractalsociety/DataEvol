@@ -39,6 +39,8 @@ class TrainConfig:
     max_seq_length: int = 256
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
+    lora_scale: float = 20.0
+    lora_dropout: float = 0.0
 
 
 class _CaptureCallback:
@@ -211,7 +213,12 @@ def train_socket_expert(
     random.seed(seed)
     model, tokenizer = load(str(model_path))
     _assert_tinyllama(model)
-    _apply_socket(model, socket)
+    _apply_socket(
+        model,
+        socket,
+        scale=config.lora_scale,
+        dropout=config.lora_dropout,
+    )
     trainable = sum(int(math.prod(value.shape)) for _, value in tree_flatten(model.trainable_parameters()))
     if trainable != int(socket["trainable_parameters"]):
         raise ValueError(f"runtime trainable parameter count {trainable} does not match socket manifest")
