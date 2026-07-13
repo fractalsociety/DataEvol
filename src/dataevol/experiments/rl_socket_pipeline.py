@@ -24,7 +24,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 from dataevol.experiments.reusable_lora_socket import (
     BANDS,
@@ -417,6 +417,131 @@ def run_sft_then_rl_test(config_path: str | Path, run_dir: str | Path) -> dict[s
     return report
 
 
+def run_targeted_arithmetic_test(config_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
+    """Compare post-SFT RL topologies on a learnable arithmetic boundary."""
+    config_path = Path(config_path)
+    root = Path(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    audit = _read_json(root / "trainer_audit.json")
+    if audit["verdict"] != "ELIGIBLE" or audit["git_commit"] != _git_commit():
+        raise RuntimeError("targeted arithmetic test requires an ELIGIBLE audit for the current Git commit")
+    config = _read_json(config_path)
+    _validate_config(config)
+    targeted = config["targeted_arithmetic"]
+    source = Path(targeted["source_run"])
+    source_report = _read_json(source / "sft_then_rl_result.json")
+    prepare_targeted_arithmetic_curriculum(root, source)
+    frozen = _evaluate_frozen_base(config, root)
+
+    socket = _tag_topology(_clone_socket(source_report["candidate"], "socket-a"), arm="targeted_arithmetic")
+    target = int(config["adapter"]["target_parameters"])
+    uniform = _tag_topology(parameter_matched_uniform(target), arm="targeted_arithmetic")
+    single_candidates = [
+        _tag_topology(parameter_matched_single(layer, target, socket_id=f"single-{layer}"), arm="targeted_arithmetic")
+        for layer in targeted["single_layers"]
+    ]
+    sft_config = TrainConfig(
+        optimizer_steps=int(config["sft"]["optimizer_steps"]),
+        batch_size=1,
+        grad_accumulation=1,
+        max_seq_length=int(config["sft"]["max_seq_length"]),
+        learning_rate=float(config["sft"]["learning_rate"]),
+        weight_decay=float(config["sft"]["weight_decay"]),
+        lora_scale=float(config["adapter"]["lora_scale"]),
+        lora_dropout=float(config["adapter"]["dropout"]),
+    )
+    topology_sft: dict[str, dict[str, Any]] = {}
+    for candidate in [uniform, *single_candidates]:
+        output = root / "topology_sft" / candidate["socket_id"]
+        topology_sft[candidate["socket_id"]] = train_socket_expert(
+            model_path=config["model"]["path"],
+            socket=candidate,
+            data_dir=source / "joint_sft",
+            output_dir=output,
+            task="matched-joint-arithmetic-python-sft",
+            config=sft_config,
+            seed=int(config["sft"]["seed"]),
+        )
+    socket_adapter = source / "joint_sft_adapter/adapters.safetensors"
+    adapter_paths = {
+        socket["socket_id"]: socket_adapter,
+        **{
+            candidate["socket_id"]: root / "topology_sft" / candidate["socket_id"] / "adapters.safetensors"
+            for candidate in [uniform, *single_candidates]
+        },
+    }
+    baselines = {
+        candidate["socket_id"]: _evaluate_adapter(config, root, candidate, adapter_paths[candidate["socket_id"]])
+        for candidate in [socket, uniform, *single_candidates]
+    }
+    lower, upper = map(float, targeted["required_start_accuracy_band"])
+    if not lower <= baselines[socket["socket_id"]]["valid"]["arithmetic"]["accuracy"] <= upper:
+        raise RuntimeError("Socket A SFT arithmetic accuracy is outside the preregistered learnable band")
+    best_single = max(
+        single_candidates,
+        key=lambda candidate: (
+            baselines[candidate["socket_id"]]["valid"]["arithmetic"]["accuracy"],
+            baselines[candidate["socket_id"]]["valid"]["python"]["accuracy"],
+        ),
+    )
+
+    protected: dict[str, list[str]] = {}
+    for candidate in [socket, uniform, best_single]:
+        profile = profile_entry_gradients(
+            config,
+            root,
+            candidate,
+            adapter_paths[candidate["socket_id"]],
+            limit=int(targeted["gradient_profile_examples_per_task"]),
+        )
+        protected[candidate["socket_id"]] = select_python_protected_entries(
+            profile, count=max(1, round(len(candidate["entries"]) * float(targeted["protected_entry_fraction"])))
+        )
+
+    methods = [
+        ("socket_sft_arithmetic", _clone_socket(socket, "socket-sft-arithmetic"), socket_adapter, {"arithmetic": 1}, protected[socket["socket_id"]]),
+        ("socket_sft_mixed", _clone_socket(socket, "socket-sft-mixed"), socket_adapter, {"arithmetic": 1, "python": 1}, protected[socket["socket_id"]]),
+        ("socket_fresh_arithmetic", _clone_socket(socket, "socket-fresh-arithmetic"), None, {"arithmetic": 1}, protected[socket["socket_id"]]),
+        ("uniform_sft_arithmetic", _clone_socket(uniform, "uniform-sft-arithmetic"), adapter_paths[uniform["socket_id"]], {"arithmetic": 1}, protected[uniform["socket_id"]]),
+        ("single_sft_arithmetic", _clone_socket(best_single, "single-sft-arithmetic"), adapter_paths[best_single["socket_id"]], {"arithmetic": 1}, protected[best_single["socket_id"]]),
+    ]
+    results: dict[str, list[dict[str, Any]]] = {}
+    for method, candidate, adapter, task_mix, frozen_entries in methods:
+        candidate = _tag_topology(candidate, arm="targeted_arithmetic")
+        results[method] = [
+            _run_candidate_subprocess(
+                config_path,
+                root,
+                candidate,
+                int(seed),
+                int(targeted["updates"]),
+                "confirmation-targeted-arithmetic",
+                method=method,
+                starting_adapter=str(adapter.resolve()) if adapter else None,
+                job_overrides={
+                    "task_mix": task_mix,
+                    "frozen_entries": frozen_entries,
+                    "evaluation_every": int(targeted["evaluation_every"]),
+                    "evaluation_task": "arithmetic",
+                    "kl_reference_kind": "sft_checkpoint" if adapter else "fresh_initial_policy",
+                },
+            )
+            for seed in targeted["seeds"]
+        ]
+    summary = summarize_targeted_arithmetic(
+        audit=audit,
+        frozen=frozen,
+        baselines=baselines,
+        best_single=best_single,
+        protected=protected,
+        topology_sft=topology_sft,
+        results=results,
+    )
+    _write_atomic_json(root / "targeted_arithmetic_result.json", summary)
+    _write_atomic_json(root / "latest_result.json", summary)
+    return summary
+
+
 def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
     root = Path(root)
     manifest_path = root / "joint_sft/manifest.json"
@@ -463,6 +588,182 @@ def prepare_joint_sft_curriculum(root: str | Path) -> dict[str, Any]:
     manifest["manifest_hash"] = _hash(manifest)
     _write_atomic_json(manifest_path, manifest)
     return manifest
+
+
+def prepare_targeted_arithmetic_curriculum(root: str | Path, source: str | Path) -> dict[str, Any]:
+    root = Path(root)
+    source = Path(source)
+    manifest_path = root / "datasets/targeted_manifest.json"
+    if manifest_path.is_file():
+        return _read_json(manifest_path)
+    (root / "datasets/python").mkdir(parents=True, exist_ok=True)
+    for split in ("train", "valid", "test"):
+        _copy_atomic(source / f"datasets/python/{split}.jsonl", root / f"datasets/python/{split}.jsonl")
+    sizes = {"train": 2_000, "valid": 300, "test": 500}
+    prompts = {
+        "train": "Calculate the sum. Return only the integer answer.\n{a} + {b} = ?",
+        "valid": "Solve the problem. Return only the integer answer.\nWhat is {a} + {b}?",
+        "test": "Return just the integer result.\nAdd {a} and {b}.",
+    }
+    manifest: dict[str, Any] = {
+        "schema": f"{SCHEMA}.targeted_arithmetic_curriculum.v1",
+        "operand_range": [0, 4],
+        "splits": {},
+    }
+    for split, count in sizes.items():
+        rng = random.Random(f"targeted-arithmetic-v1:{split}:4403")
+        rows = []
+        for index in range(count):
+            a, b = rng.randint(0, 4), rng.randint(0, 4)
+            rows.append({
+                "id": f"targeted-arithmetic-{split}-{index:04d}",
+                "family": "small_integer_addition",
+                "prompt": prompts[split].format(a=a, b=b),
+                "completion": str(a + b),
+                "answer": str(a + b),
+            })
+        path = root / f"datasets/arithmetic/{split}.jsonl"
+        _write_atomic_jsonl(path, rows)
+        manifest["splits"][split] = {"rows": count, "sha256": _file_hash(path)}
+    manifest["manifest_hash"] = _hash(manifest)
+    _write_atomic_json(manifest_path, manifest)
+    return manifest
+
+
+def _evaluate_adapter(
+    config: Mapping[str, Any],
+    root: Path,
+    candidate: Mapping[str, Any],
+    adapter_path: Path,
+) -> dict[str, Any]:
+    from mlx_lm import load
+
+    model, tokenizer = load(config["model"]["path"])
+    _apply_socket(
+        model,
+        candidate,
+        scale=float(config["adapter"]["lora_scale"]),
+        dropout=float(config["adapter"]["dropout"]),
+    )
+    model.load_weights(list(mx.load(str(adapter_path)).items()), strict=False)
+    mx.eval(model.parameters())
+    return {
+        split: _evaluate_candidate(
+            model,
+            tokenizer,
+            root / "datasets",
+            limit=int(config["evaluation"]["limit"]),
+            split=split,
+        )
+        for split in ("valid", "test")
+    }
+
+
+def profile_entry_gradients(
+    config: Mapping[str, Any],
+    root: Path,
+    candidate: Mapping[str, Any],
+    adapter_path: Path,
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    from mlx_lm import load
+
+    report_path = root / "gradient_profiles" / f"{candidate['socket_id']}.json"
+    if report_path.is_file():
+        return _read_json(report_path)
+    model, tokenizer = load(config["model"]["path"])
+    _apply_socket(
+        model,
+        candidate,
+        scale=float(config["adapter"]["lora_scale"]),
+        dropout=float(config["adapter"]["dropout"]),
+    )
+    model.load_weights(list(mx.load(str(adapter_path)).items()), strict=False)
+    totals = {task: {entry_key(entry): 0.0 for entry in candidate["entries"]} for task in ("arithmetic", "python")}
+    for task in ("arithmetic", "python"):
+        rows = _read_jsonl(root / f"datasets/{task}/valid.jsonl")[:limit]
+        for row in rows:
+            prompt = _prompt_tokens(tokenizer, row["prompt"])
+            completion = list(tokenizer.encode(row["completion"], add_special_tokens=False))
+            tokens, prompt_lengths, completion_lengths = _pad_rollouts(prompt, [completion], tokenizer.eos_token_id or 0)
+
+            def objective() -> mx.array:
+                logprobs, mask = completion_logprobs(model(tokens), tokens, prompt_lengths, completion_lengths)
+                return -masked_mean(logprobs, mask)
+
+            _, gradients = nn.value_and_grad(model, objective)()
+            norms = gradient_norms_by_entry(gradients, candidate)
+            mx.eval(*[value for _, value in tree_flatten(gradients)])
+            for key, value in norms.items():
+                totals[task][key] += value / max(1, len(rows))
+    body = {
+        "schema": f"{SCHEMA}.entry_gradient_profile.v1",
+        "candidate_id": candidate["socket_id"],
+        "socket_hash": candidate["socket_hash"],
+        "examples_per_task": limit,
+        "gradient_norms": totals,
+    }
+    report = {**body, "profile_hash": _hash(body)}
+    _write_atomic_json(report_path, report)
+    return report
+
+
+def select_python_protected_entries(profile: Mapping[str, Any], *, count: int) -> list[str]:
+    gradients = profile["gradient_norms"]
+    ranked = sorted(
+        gradients["python"],
+        key=lambda key: (
+            gradients["python"][key] / max(1e-12, gradients["python"][key] + gradients["arithmetic"][key]),
+            gradients["python"][key],
+        ),
+        reverse=True,
+    )
+    return ranked[:count]
+
+
+def summarize_targeted_arithmetic(
+    *,
+    audit: Mapping[str, Any],
+    frozen: Mapping[str, Any],
+    baselines: Mapping[str, Any],
+    best_single: Mapping[str, Any],
+    protected: Mapping[str, Any],
+    topology_sft: Mapping[str, Any],
+    results: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    methods = {}
+    for method, rows in results.items():
+        arithmetic = [float(row["behavior"]["arithmetic"]["accuracy"]) for row in rows]
+        python = [float(row["behavior"]["python"]["accuracy"]) for row in rows]
+        methods[method] = {
+            "seeds": [int(row["seed"]) for row in rows],
+            "mean_arithmetic_accuracy": float(np.mean(arithmetic)),
+            "mean_python_retention": float(np.mean(python)),
+            "arithmetic_accuracy_by_seed": arithmetic,
+            "python_retention_by_seed": python,
+            "healthy": all(not row["unhealthy"] and not row["aborted_early"] for row in rows),
+            "result_hashes": [row["result_hash"] for row in rows],
+        }
+    socket_baseline = float(baselines["socket-a"]["test"]["arithmetic"]["accuracy"])
+    continued = methods["socket_sft_arithmetic"]
+    improvement = continued["mean_arithmetic_accuracy"] - socket_baseline
+    supported = continued["healthy"] and improvement > 0
+    body = {
+        "schema": f"{SCHEMA}.targeted_arithmetic_result.v1",
+        "audit_hash": audit["audit_hash"],
+        "frozen_behavior": frozen["valid"],
+        "sft_baselines": baselines,
+        "best_single_layer": best_single["socket_id"],
+        "protected_python_entries": protected,
+        "topology_sft": topology_sft,
+        "methods": methods,
+        "socket_sft_arithmetic_improvement": improvement,
+        "weight_continuation_supported": supported,
+        "verdict": "RL_IMPROVES_SOCKET_SFT" if supported else "RL_AFTER_SFT_NOT_IMPROVED",
+        "completed_at": utc_now(),
+    }
+    return {**body, "result_hash": _hash(body)}
 
 
 def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
@@ -533,8 +834,15 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         for task in ("arithmetic", "python")
     }
     started = time.perf_counter()
+    task_schedule = [
+        task
+        for task, frequency in job.get("task_mix", {"arithmetic": 1, "python": 1}).items()
+        for _ in range(int(frequency))
+    ]
+    if not task_schedule or any(task not in datasets for task in task_schedule):
+        raise ValueError("task_mix must contain positive arithmetic/Python frequencies")
     while update < int(job["target_update"]):
-        task = ("arithmetic", "python")[update % 2]
+        task = task_schedule[update % len(task_schedule)]
         row = random.choice(datasets[task])
         prompt_tokens = _prompt_tokens(tokenizer, row["prompt"])
         task_max_tokens = int(
@@ -577,6 +885,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         before = {name: mx.array(value) for name, value in tree_flatten(model.trainable_parameters())}
 
         epoch_gradient_norms = []
+        epoch_entry_gradient_norms: list[dict[str, float]] = []
         for _ in range(int(job.get("ppo_epochs", 1))):
             runtime_ppo = replace(ppo_config, beta=current_beta)
 
@@ -587,6 +896,12 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             (loss, metrics), gradients = loss_and_grad()
             mx.eval(loss, *metrics.values(), *[value for _, value in tree_flatten(gradients)], *before.values())
             gradients, gradient_norm = clip_gradients(gradients, ppo_config.max_grad_norm)
+            epoch_entry_gradient_norms.append(gradient_norms_by_entry(gradients, job["candidate"]))
+            gradients = mask_frozen_entry_gradients(
+                gradients,
+                job["candidate"],
+                set(job.get("frozen_entries", [])),
+            )
             finite = all(bool(mx.all(mx.isfinite(value))) for _, value in tree_flatten(gradients))
             if not finite:
                 health_history.append({"update": update, "unhealthy": True, "reason": "non-finite gradient"})
@@ -605,6 +920,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         health = {
             "update": update + 1,
             "task": task,
+            "task_family": row.get("family", task),
             "mean_task_reward": float(reward_array.mean()),
             "pass_at_1": float(reward_array[0] >= 1.0),
             "pass_at_group_size": float(np.any(reward_array >= 1.0)),
@@ -618,6 +934,10 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             "kl_divergence": float(metrics["kl"]),
             "clip_fraction": float(metrics["clip_fraction"]),
             "gradient_norm": float(np.mean(epoch_gradient_norms)),
+            "gradient_norm_by_entry": {
+                key: float(np.mean([values[key] for values in epoch_entry_gradient_norms]))
+                for key in epoch_entry_gradient_norms[0]
+            },
             "adapter_update_norm": update_norm,
             "loss": float(loss),
             "hard_limit_fraction": float(np.mean([len(item) >= task_max_tokens for item in completions])),
@@ -636,6 +956,15 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
             )
         health["next_kl_beta"] = current_beta
         health["unhealthy"] = _is_unhealthy(health, job["health"])
+        evaluation_every = int(job.get("evaluation_every", 0))
+        if evaluation_every and (update + 1) % evaluation_every == 0:
+            health["heldout_behavior"] = _evaluate_candidate(
+                model,
+                tokenizer,
+                data_root,
+                limit=int(job["evaluation"]["limit"]),
+                split=str(job["evaluation"]["split"]),
+            )
         health_history.append(health)
         update += 1
         abort_reason = _health_abort_reason(health_history, job["health"])
@@ -664,6 +993,17 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     summary["aborted_early"] = abort_reason is not None
     summary["abort_reason"] = abort_reason
     summary["unhealthy"] = bool(summary["unhealthy"] or abort_reason)
+    summary["kl_reference_kind"] = job.get("kl_reference_kind", "base_or_initial_policy")
+    summary["kl_reference_adapter_sha256"] = (
+        _file_hash(Path(starting_adapter)) if starting_adapter else None
+    )
+    summary["frozen_entries"] = list(job.get("frozen_entries", []))
+    summary["task_mix"] = dict(job.get("task_mix", {"arithmetic": 1, "python": 1}))
+    summary["heldout_evaluation_curve"] = [
+        {"update": row["update"], **row["heldout_behavior"]}
+        for row in health_history
+        if "heldout_behavior" in row
+    ]
     prior = [_read_json(path) for path in sorted(candidate_dir.glob("metrics-*.json"))]
     curve = sorted(
         [{"generated_tokens": row["generated_tokens"], "behavioral_accuracy": row["behavioral_accuracy"]} for row in prior]
@@ -692,6 +1032,7 @@ def _run_candidate_subprocess(
     *,
     method: str | None = None,
     starting_adapter: str | None = None,
+    job_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = _read_json(config_path)
     job = {
@@ -722,6 +1063,8 @@ def _run_candidate_subprocess(
         "adapter_contract": config["adapter"],
         "shuffle_rewards": method == "shuffled_reward_control",
     }
+    if job_overrides:
+        job.update(dict(job_overrides))
     job_dir = root / "job_specs"
     job_dir.mkdir(parents=True, exist_ok=True)
     job_path = job_dir / f"{candidate['socket_id']}-seed-{seed}-to-{target_update}.json"
@@ -1290,6 +1633,20 @@ def _summarize_job(job: Mapping[str, Any], health: Sequence[Mapping[str, Any]], 
     behavioral_improvement_per_1k = 1000.0 * behavioral_improvement / max(1, generated_tokens)
     efficiency = min(1.0, max(0.0, behavioral_improvement_per_1k) / float(job.get("selection", {}).get("efficiency_scale", 0.02)))
     score = 0.45 * behavior["arithmetic"]["accuracy"] + 0.35 * behavior["python"]["accuracy"] + 0.10 * efficiency + 0.05 * retention + 0.05 * stability
+    task_families = sorted({str(row.get("task_family", row.get("task", "unknown"))) for row in recent})
+    reward_by_task_family = {
+        family: float(np.mean([
+            row["mean_task_reward"]
+            for row in recent
+            if str(row.get("task_family", row.get("task", "unknown"))) == family
+        ]))
+        for family in task_families
+    }
+    entry_keys = sorted({key for row in recent for key in row.get("gradient_norm_by_entry", {})})
+    gradient_norm_by_entry = {
+        key: float(np.mean([row["gradient_norm_by_entry"][key] for row in recent if key in row.get("gradient_norm_by_entry", {})]))
+        for key in entry_keys
+    }
     body = {
         "schema": f"{SCHEMA}.candidate_result.v1",
         "candidate_id": job["candidate"]["socket_id"],
@@ -1301,6 +1658,7 @@ def _summarize_job(job: Mapping[str, Any], health: Sequence[Mapping[str, Any]], 
         "target_updates": job["target_update"],
         "generated_tokens": generated_tokens,
         "mean_task_reward": mean_reward,
+        "reward_by_task_family": reward_by_task_family,
         "reward_per_1000_generated_tokens": reward_per_1k,
         "behavioral_improvement": behavioral_improvement,
         "behavioral_improvement_per_1000_generated_tokens": behavioral_improvement_per_1k,
@@ -1315,6 +1673,7 @@ def _summarize_job(job: Mapping[str, Any], health: Sequence[Mapping[str, Any]], 
         "kl_divergence": float(np.mean([row["kl_divergence"] for row in recent])),
         "clip_fraction": float(np.mean([row["clip_fraction"] for row in recent])),
         "gradient_norm": float(np.mean([row["gradient_norm"] for row in recent])),
+        "gradient_norm_by_entry": gradient_norm_by_entry,
         "adapter_update_norm": float(np.mean([row["adapter_update_norm"] for row in recent])),
         "unhealthy": (
             any(row["unhealthy"] for row in recent)
@@ -1466,6 +1825,48 @@ def _tag_topology(socket: Mapping[str, Any], *, arm: str) -> dict[str, Any]:
     tagged["arm"] = arm
     tagged["topology_families"] = _topology_families(socket)
     return tagged
+
+
+def entry_key(entry: Mapping[str, Any]) -> str:
+    return f"layer-{int(entry['layer'])}:family-{entry['family']}"
+
+
+def _parameter_entry_key(name: str, candidate: Mapping[str, Any]) -> str | None:
+    for entry in candidate["entries"]:
+        layer_prefix = f"model.layers.{int(entry['layer'])}."
+        if layer_prefix not in name:
+            continue
+        family = str(entry["family"])
+        if family == "A" and (".self_attn.q_proj." in name or ".self_attn.v_proj." in name):
+            return entry_key(entry)
+        if family == "B" and ".self_attn.o_proj." in name:
+            return entry_key(entry)
+        if family == "C" and ".mlp.down_proj." in name:
+            return entry_key(entry)
+    return None
+
+
+def gradient_norms_by_entry(gradients: Any, candidate: Mapping[str, Any]) -> dict[str, float]:
+    squared = {entry_key(entry): 0.0 for entry in candidate["entries"]}
+    for name, value in tree_flatten(gradients):
+        key = _parameter_entry_key(name, candidate)
+        if key is not None:
+            squared[key] += float(mx.sum(value.astype(mx.float32) ** 2))
+    return {key: math.sqrt(value) for key, value in squared.items()}
+
+
+def mask_frozen_entry_gradients(
+    gradients: Any,
+    candidate: Mapping[str, Any],
+    frozen_entries: set[str],
+) -> Any:
+    if not frozen_entries:
+        return gradients
+    flattened = []
+    for name, value in tree_flatten(gradients):
+        key = _parameter_entry_key(name, candidate)
+        flattened.append((name, mx.zeros_like(value) if key in frozen_entries else value))
+    return tree_unflatten(flattened)
 
 
 def _topology_families(socket: Mapping[str, Any]) -> list[str]:
@@ -1635,6 +2036,13 @@ def _write_atomic_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     temporary.replace(path)
 
 
+def _copy_atomic(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_bytes(source.read_bytes())
+    temporary.replace(destination)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the audited RL socket v2 experiment")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1651,6 +2059,9 @@ def main() -> None:
     sft_rl = subparsers.add_parser("sft-then-rl-test")
     sft_rl.add_argument("--config", required=True, type=Path)
     sft_rl.add_argument("--run", required=True, type=Path)
+    targeted = subparsers.add_parser("targeted-arithmetic-test")
+    targeted.add_argument("--config", required=True, type=Path)
+    targeted.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -1662,6 +2073,8 @@ def main() -> None:
         result = run_two_seed_test(args.config, args.run)
     elif args.command == "sft-then-rl-test":
         result = run_sft_then_rl_test(args.config, args.run)
+    elif args.command == "targeted-arithmetic-test":
+        result = run_targeted_arithmetic_test(args.config, args.run)
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))

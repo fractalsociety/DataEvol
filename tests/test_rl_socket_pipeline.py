@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 
+import mlx.core as mx
+from mlx.utils import tree_flatten, tree_unflatten
+
 from dataevol.experiments.reusable_lora_socket import generate_socket_candidates
 from dataevol.experiments.rl_socket_pipeline import (
     FAMILIES,
@@ -13,7 +16,12 @@ from dataevol.experiments.rl_socket_pipeline import (
     _training_reward,
     _validate_config,
     build_candidate_manifest,
+    entry_key,
+    gradient_norms_by_entry,
+    mask_frozen_entry_gradients,
     prepare_joint_sft_curriculum,
+    prepare_targeted_arithmetic_curriculum,
+    select_python_protected_entries,
 )
 
 
@@ -135,3 +143,51 @@ def test_joint_sft_curriculum_covers_python_families_in_every_split(tmp_path) ->
         text = (tmp_path / f"datasets/python/{split}.jsonl").read_text()
         for function in ("clamp", "is_even", "last_item", "add_tax", "contains", "square", "first_item", "subtract"):
             assert f"def {function}" in text
+
+
+def test_targeted_arithmetic_curriculum_is_disjoint_and_in_learnable_range(tmp_path) -> None:
+    source = tmp_path / "source"
+    prepare_joint_sft_curriculum(source)
+
+    manifest = prepare_targeted_arithmetic_curriculum(tmp_path / "run", source)
+
+    assert manifest["operand_range"] == [0, 4]
+    train = (tmp_path / "run/datasets/arithmetic/train.jsonl").read_text()
+    valid = (tmp_path / "run/datasets/arithmetic/valid.jsonl").read_text()
+    test = (tmp_path / "run/datasets/arithmetic/test.jsonl").read_text()
+    assert "Calculate the sum" in train
+    assert "What is" in valid
+    assert "Add" in test
+    assert manifest["splits"]["train"]["sha256"] != manifest["splits"]["valid"]["sha256"]
+
+
+def test_entry_gradient_logging_and_masking_use_socket_entries() -> None:
+    candidate = {
+        "entries": [
+            {"layer": 3, "family": "C", "rank": 1},
+            {"layer": 5, "family": "B", "rank": 1},
+        ]
+    }
+    gradients = tree_unflatten([
+        ("model.layers.3.mlp.down_proj.lora_a", mx.array([3.0, 4.0])),
+        ("model.layers.5.self_attn.o_proj.lora_a", mx.array([12.0])),
+    ])
+
+    norms = gradient_norms_by_entry(gradients, candidate)
+    masked = dict(tree_flatten(mask_frozen_entry_gradients(
+        gradients, candidate, {entry_key(candidate["entries"][0])}
+    )))
+
+    assert norms == {"layer-3:family-C": 5.0, "layer-5:family-B": 12.0}
+    assert bool(mx.all(masked["model.layers.3.mlp.down_proj.lora_a"] == 0))
+    assert bool(mx.all(masked["model.layers.5.self_attn.o_proj.lora_a"] == 12))
+
+
+def test_python_protection_uses_task_specific_gradient_ratio() -> None:
+    profile = {
+        "gradient_norms": {
+            "arithmetic": {"python-specific": 1.0, "shared": 8.0},
+            "python": {"python-specific": 9.0, "shared": 8.0},
+        }
+    }
+    assert select_python_protected_entries(profile, count=1) == ["python-specific"]
