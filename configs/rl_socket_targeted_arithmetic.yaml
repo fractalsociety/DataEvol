@@ -224,6 +224,7 @@
     "single_layer_source_run": ".dataevol/experiments/rl_socket_targeted_arithmetic_v1e",
     "required_start_accuracy_band": [0.35, 0.65],
     "probe_examples": 32,
+    "probe_seed": 19421,
     "gain_recovery_target": 0.95,
     "updates": 60,
     "evaluation_every": 10,

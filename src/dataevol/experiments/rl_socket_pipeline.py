@@ -1274,6 +1274,7 @@ def run_calibration_depth_policy_test(
         limit=int(experiment["probe_examples"]),
         tasks=("calibration",),
         frozen_entries=prior_entries,
+        seed=int(experiment["probe_seed"]),
     )
     depth_decision = profile["depth_policy"]["calibration"]
     if depth_decision["profile"] != "late_concentrated":
@@ -1736,12 +1737,16 @@ def profile_entry_gradients(
     limit: int,
     tasks: Sequence[str] = ("arithmetic", "python"),
     frozen_entries: Sequence[str] = (),
+    seed: int = 19_421,
 ) -> dict[str, Any]:
     from mlx_lm import load
 
     report_path = root / "gradient_profiles" / f"{candidate['socket_id']}.json"
     if report_path.is_file():
         return _read_json(report_path)
+    mx.random.seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
     model, tokenizer = load(config["model"]["path"])
     _apply_socket(
         model,
@@ -1780,6 +1785,7 @@ def profile_entry_gradients(
         "candidate_id": candidate["socket_id"],
         "socket_hash": candidate["socket_hash"],
         "examples_per_task": limit,
+        "probe_seed": seed,
         "gradient_norms": totals,
         "depth_policy": {
             task: classify_depth_profile(values, num_layers=22)

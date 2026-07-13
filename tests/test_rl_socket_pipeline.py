@@ -127,6 +127,7 @@ def test_targeted_confirmation_budget_is_pinned_to_sixty_updates() -> None:
     assert config["warm_start_dynamic_socket"]["socket_warmup_schedule"]["activation_lr_warmup_updates"] == 5
     assert config["calibration_depth_policy"]["seeds"] == [43, 71]
     assert config["calibration_depth_policy"]["gain_recovery_target"] == 0.95
+    assert config["calibration_depth_policy"]["probe_seed"] == 19_421
     assert config["placement_confirmation"]["schedule"]["learning_rate"] == 5e-6
     assert [row["learning_rate"] for row in config["uniform_kl_sweep"]["schedules"]] == [1e-5, 5e-6, 2e-6]
 
