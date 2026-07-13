@@ -1013,7 +1013,12 @@ def run_dynamic_socket_test(config_path: str | Path, run_dir: str | Path) -> dic
     return report
 
 
-def run_warm_start_dynamic_socket_test(config_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
+def run_warm_start_dynamic_socket_test(
+    config_path: str | Path,
+    run_dir: str | Path,
+    *,
+    schedule_key: str = "schedule",
+) -> dict[str, Any]:
     """Use the SFT LayerScope result as the initial mask and schedule only drift."""
     config_path = Path(config_path)
     root = Path(run_dir)
@@ -1049,7 +1054,7 @@ def run_warm_start_dynamic_socket_test(config_path: str | Path, run_dir: str | P
         for seed in experiment["seeds"]
     ]
 
-    schedule = experiment["schedule"]
+    schedule = experiment[schedule_key]
     ppo = {
         **config["ppo"],
         "learning_rate": float(schedule["learning_rate"]),
@@ -1073,6 +1078,7 @@ def run_warm_start_dynamic_socket_test(config_path: str | Path, run_dir: str | P
         "proxy_reward_window": int(experiment["proxy_reward_window"]),
         "proxy_minimum_reward_gain": float(experiment["proxy_minimum_reward_gain"]),
         "proxy_widen_parameters": 0,
+        "activation_lr_warmup_updates": int(schedule.get("activation_lr_warmup_updates", 0)),
     }
     results = [
         _run_candidate_subprocess(
@@ -1082,7 +1088,7 @@ def run_warm_start_dynamic_socket_test(config_path: str | Path, run_dir: str | P
             int(seed),
             int(experiment["updates"]),
             "confirmation-warm-start-dynamic-socket",
-            method="warm_start_dynamic_socket",
+            method=f"warm_start_dynamic_socket:{schedule_key}",
             starting_adapters=[str(single_adapter.resolve())],
             job_overrides={
                 "task_mix": {"arithmetic": 1},
@@ -1113,6 +1119,7 @@ def run_warm_start_dynamic_socket_test(config_path: str | Path, run_dir: str | P
         prior_entries=prior_entries,
         prior_adapter_hash=_file_hash(single_adapter),
         optimizer_candidate_parameters=int(candidate["trainable_parameters"]),
+        schedule={"id": schedule_key, **schedule},
         bootstrap_draws=int(config["confirmation"]["bootstrap_draws"]),
     )
     _write_atomic_json(root / "warm_start_dynamic_socket_result.json", report)
@@ -1794,6 +1801,7 @@ def summarize_warm_start_dynamic_socket_test(
     prior_entries: Sequence[str],
     prior_adapter_hash: str,
     optimizer_candidate_parameters: int,
+    schedule: Mapping[str, Any],
     bootstrap_draws: int,
 ) -> dict[str, Any]:
     warm_accuracy = [float(row["behavior"]["arithmetic"]["accuracy"]) for row in results]
@@ -1829,6 +1837,7 @@ def summarize_warm_start_dynamic_socket_test(
             "entries": list(prior_entries),
             "adapter_sha256": prior_adapter_hash,
         },
+        "schedule": dict(schedule),
         "sft_arithmetic_accuracy": float(baseline["accuracy"]),
         "warm_accuracy_by_seed": warm_accuracy,
         "mean_warm_accuracy": float(np.mean(warm_accuracy)),
@@ -1845,6 +1854,8 @@ def summarize_warm_start_dynamic_socket_test(
         "python_retention_by_seed": python,
         "mean_kl_by_seed": [float(row["kl_divergence"]) for row in results],
         "healthy": healthy,
+        "updates_by_seed": [int(row["updates"]) for row in results],
+        "abort_reasons": [row.get("abort_reason") for row in results],
         "mask_by_seed": [row["dynamic_socket"] for row in results],
         "optimizer_memory_proxy": {
             "candidate_parameters_with_moments": optimizer_candidate_parameters,
@@ -1938,9 +1949,12 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
     dynamic_config = job.get("dynamic_socket")
     if dynamic_config and float(ppo_config.weight_decay) != 0.0:
         raise ValueError("scheduled socket masks require zero RL weight decay")
+    if dynamic_config and dynamic_config.get("activation_lr_warmup_updates", 0) and int(job.get("ppo_epochs", 1)) != 1:
+        raise ValueError("per-socket step warmup currently requires one PPO epoch")
     active_entries = set(dynamic_config.get("initial_active_entries", [])) if dynamic_config else set()
     dynamic_budget = int(dynamic_config["initial_parameter_budget"]) if dynamic_config else 0
     force_reprobe = bool(dynamic_config and dynamic_config.get("reprobe_on_first_update", True))
+    entry_activation_updates = {key: 0 for key in active_entries}
     latest = _latest_checkpoint(candidate_dir / "checkpoints")
     if latest:
         loaded = load_checkpoint(latest, model=model, optimizer=optimizer, sampler=sampler)
@@ -1957,6 +1971,12 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                 health_history[-1].get("dynamic_parameter_budget", dynamic_budget),
             ))
             force_reprobe = bool(health_history[-1].get("force_reprobe_next", False))
+            entry_activation_updates = {
+                str(key): int(value)
+                for key, value in health_history[-1].get(
+                    "entry_activation_updates", entry_activation_updates
+                ).items()
+            }
     data_root = root / "datasets"
     datasets = {
         task: _read_jsonl(data_root / task / "train.jsonl")
@@ -2053,6 +2073,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                     key: float(np.mean([row.get(key, 0.0) for row in recent_norms]))
                     for key in current_entry_norms
                 }
+                previous_active_entries = set(active_entries)
                 active_entries = select_scheduled_socket_entries(
                     job["candidate"],
                     averaged_norms,
@@ -2061,11 +2082,21 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                     parameter_budget=dynamic_budget,
                     hysteresis_ratio=float(dynamic_config["hysteresis_ratio"]),
                 )
+                for key in active_entries - previous_active_entries:
+                    entry_activation_updates[key] = update
                 force_reprobe = False
             inactive_entries = (
                 {entry_key(entry) for entry in job["candidate"]["entries"]} - active_entries
                 if dynamic_config else set()
             )
+            warmup_updates = int(dynamic_config.get("activation_lr_warmup_updates", 0)) if dynamic_config else 0
+            entry_step_scales = {
+                key: (
+                    min(1.0, (update - entry_activation_updates.get(key, update) + 1) / warmup_updates)
+                    if warmup_updates > 0 else 1.0
+                )
+                for key in active_entries
+            }
             gradients = mask_frozen_entry_gradients(
                 gradients,
                 job["candidate"],
@@ -2081,6 +2112,14 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                 raise FloatingPointError("non-finite gradient")
             optimizer.update(model, gradients)
             mx.eval(model.parameters(), optimizer.state, loss, *metrics.values(), gradient_norm)
+            if dynamic_config and warmup_updates > 0:
+                model.update(scale_candidate_parameter_deltas(
+                    model.trainable_parameters(),
+                    before,
+                    job["candidate"],
+                    entry_step_scales,
+                ))
+                mx.eval(model.parameters())
             epoch_gradient_norms.append(float(gradient_norm))
         update_norm = math.sqrt(sum(float(mx.sum((value - before[name]) ** 2)) for name, value in tree_flatten(model.trainable_parameters())))
         entropy = _policy_entropy(model(tokens), batch)
@@ -2121,6 +2160,8 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                 "dynamic_parameter_budget": dynamic_budget,
                 "reserve_socket_entries": sorted(dynamic_config["reserve_entries"]),
                 "socket_phase": dynamic_config["phase"],
+                "entry_activation_updates": dict(sorted(entry_activation_updates.items())),
+                "entry_step_scales": dict(sorted(entry_step_scales.items())),
             })
         if health["kl_divergence"] > float(job["health"]["kl_threshold"]):
             current_beta = min(
@@ -3228,6 +3269,21 @@ def proxy_true_gap_detected(
     return recent_reward >= previous_reward + minimum_reward_gain and current_accuracy <= previous_accuracy
 
 
+def scale_candidate_parameter_deltas(
+    parameters: Mapping[str, Any],
+    before: Mapping[str, mx.array],
+    candidate: Mapping[str, Any],
+    entry_scales: Mapping[str, float],
+) -> dict[str, Any]:
+    """Apply a per-entry multiplier to an optimizer-produced parameter step."""
+    adjusted = []
+    for name, value in tree_flatten(parameters):
+        key = _parameter_entry_key(name, candidate)
+        scale = float(entry_scales.get(key, 1.0)) if key is not None else 1.0
+        adjusted.append((name, before[name] + scale * (value - before[name])))
+    return tree_unflatten(adjusted)
+
+
 def mask_frozen_entry_gradients(
     gradients: Any,
     candidate: Mapping[str, Any],
@@ -3450,6 +3506,9 @@ def main() -> None:
     warm = subparsers.add_parser("warm-start-dynamic-socket-test")
     warm.add_argument("--config", required=True, type=Path)
     warm.add_argument("--run", required=True, type=Path)
+    warm_ramp = subparsers.add_parser("warm-start-dynamic-socket-ramp-test")
+    warm_ramp.add_argument("--config", required=True, type=Path)
+    warm_ramp.add_argument("--run", required=True, type=Path)
     worker = subparsers.add_parser("worker")
     worker.add_argument("--job", required=True, type=Path)
     args = parser.parse_args()
@@ -3473,6 +3532,10 @@ def main() -> None:
         result = run_dynamic_socket_test(args.config, args.run)
     elif args.command == "warm-start-dynamic-socket-test":
         result = run_warm_start_dynamic_socket_test(args.config, args.run)
+    elif args.command == "warm-start-dynamic-socket-ramp-test":
+        result = run_warm_start_dynamic_socket_test(
+            args.config, args.run, schedule_key="socket_warmup_schedule"
+        )
     else:
         result = run_pipeline(args.config, args.run, resume=args.resume)
     print(json.dumps(result, indent=2, sort_keys=True))

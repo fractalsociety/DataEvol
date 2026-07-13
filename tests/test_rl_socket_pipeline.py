@@ -36,6 +36,7 @@ from dataevol.experiments.rl_socket_pipeline import (
     prepare_targeted_arithmetic_curriculum,
     prepare_uniform_kl_sweep_curriculum,
     proxy_true_gap_detected,
+    scale_candidate_parameter_deltas,
     select_scheduled_socket_entries,
     select_python_protected_entries,
     summarize_warm_start_dynamic_socket_test,
@@ -118,6 +119,8 @@ def test_targeted_confirmation_budget_is_pinned_to_sixty_updates() -> None:
     assert config["dynamic_socket"]["reprobe_every_updates"] == 5
     assert config["warm_start_dynamic_socket"]["gain_recovery_target"] == 0.95
     assert config["warm_start_dynamic_socket"]["maximum_parameter_budget"] == 2_500_000
+    assert config["warm_start_dynamic_socket"]["socket_warmup_schedule"]["beta"] == 0.4
+    assert config["warm_start_dynamic_socket"]["socket_warmup_schedule"]["activation_lr_warmup_updates"] == 5
     assert config["placement_confirmation"]["schedule"]["learning_rate"] == 5e-6
     assert [row["learning_rate"] for row in config["uniform_kl_sweep"]["schedules"]] == [1e-5, 5e-6, 2e-6]
 
@@ -303,6 +306,22 @@ def test_scheduled_socket_selection_enforces_budget_reserve_and_hysteresis() -> 
     assert selected == {"layer-0:family-B", "layer-2:family-A"}
 
 
+def test_per_socket_step_warmup_scales_parameter_delta_not_optimizer_gradient() -> None:
+    name = "model.layers.2.self_attn.q_proj.lora_a"
+    parameters = tree_unflatten([(name, mx.array([10.0]))])
+    before = {name: mx.array([0.0])}
+    candidate = {"entries": [{"layer": 2, "family": "A", "rank": 1}]}
+
+    adjusted = dict(tree_flatten(scale_candidate_parameter_deltas(
+        parameters,
+        before,
+        candidate,
+        {"layer-2:family-A": 0.2},
+    )))
+
+    assert float(adjusted[name][0]) == 2.0
+
+
 def test_proxy_true_gap_requires_rising_reward_and_flat_heldout_behavior() -> None:
     history = [
         {"mean_task_reward": 0.1 + index * 0.001}
@@ -337,6 +356,7 @@ def test_warm_start_summary_requires_gain_recovery_and_reports_overallocation() 
         },
         "unhealthy": False,
         "aborted_early": False,
+        "updates": 60,
         "kl_divergence": 0.01,
         "health_tail": [{"active_socket_parameter_count": 2_500_000}],
         "dynamic_socket": {"final_active_entries": ["layer-2:family-A"]},
@@ -352,6 +372,7 @@ def test_warm_start_summary_requires_gain_recovery_and_reports_overallocation() 
         prior_entries=["layer-2:family-A"],
         prior_adapter_hash="adapter",
         optimizer_candidate_parameters=4_800_000,
+        schedule={"id": "test", "beta": 0.8},
         bootstrap_draws=500,
     )
 

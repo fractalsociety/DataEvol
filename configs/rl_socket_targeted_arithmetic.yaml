@@ -197,6 +197,13 @@
       "beta": 0.4,
       "max_grad_norm": 0.5,
       "kl_beta_max": 4.0
+    },
+    "socket_warmup_schedule": {
+      "learning_rate": 0.000005,
+      "beta": 0.4,
+      "max_grad_norm": 0.5,
+      "kl_beta_max": 4.0,
+      "activation_lr_warmup_updates": 5
     }
   },
   "checkpoint_every": 20,
