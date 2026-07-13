@@ -166,7 +166,7 @@ def test_targeted_arithmetic_curriculum_is_disjoint_and_in_learnable_range(tmp_p
     test = (tmp_path / "run/datasets/arithmetic/test.jsonl").read_text()
     assert "Calculate the sum" in train
     assert "What is" in valid
-    assert "Add" in test
+    assert "Compute" in test
     assert manifest["splits"]["train"]["sha256"] != manifest["splits"]["valid"]["sha256"]
 
 

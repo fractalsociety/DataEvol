@@ -1,6 +1,6 @@
 {
   "schema": "dataevol.rl_socket_v2.config.v1",
-  "run_id": "rl-socket-targeted-arithmetic-v1c",
+  "run_id": "rl-socket-targeted-arithmetic-v1d-confirmation",
   "model": {
     "id": "mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit",
     "path": ".dataevol/models/tinyllama-1.1b-chat-4bit",
@@ -79,7 +79,7 @@
   "confirmation": {
     "seeds": [17, 29],
     "automatic_extra_seeds": [],
-    "updates": 100,
+    "updates": 60,
     "noninferiority_margin": 0.02,
     "bootstrap_draws": 10000
   },

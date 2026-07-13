@@ -522,7 +522,7 @@ def run_targeted_arithmetic_test(config_path: str | Path, run_dir: str | Path) -
                     "task_mix": task_mix,
                     "frozen_entries": frozen_entries,
                     "evaluation_every": int(targeted["evaluation_every"]),
-                    "evaluation_task": "arithmetic",
+                    "monitoring_split": "valid",
                     "kl_reference_kind": "sft_checkpoint" if adapter else "fresh_initial_policy",
                 },
             )
@@ -603,15 +603,16 @@ def prepare_targeted_arithmetic_curriculum(root: str | Path, source: str | Path)
     prompts = {
         "train": "Calculate the sum. Return only the integer answer.\n{a} + {b} = ?",
         "valid": "Solve the problem. Return only the integer answer.\nWhat is {a} + {b}?",
-        "test": "Return just the integer result.\nAdd {a} and {b}.",
+        "test": "Compute {a} plus {b}. Answer with one integer.",
     }
     manifest: dict[str, Any] = {
-        "schema": f"{SCHEMA}.targeted_arithmetic_curriculum.v1",
+        "schema": f"{SCHEMA}.targeted_arithmetic_curriculum.v2",
         "operand_range": [0, 4],
         "splits": {},
     }
     for split, count in sizes.items():
-        rng = random.Random(f"targeted-arithmetic-v1:{split}:4403")
+        panel_version = "v2-unseen" if split == "test" else "v1"
+        rng = random.Random(f"targeted-arithmetic-{panel_version}:{split}:4403")
         rows = []
         for index in range(count):
             a, b = rng.randint(0, 4), rng.randint(0, 4)
@@ -963,7 +964,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
                 tokenizer,
                 data_root,
                 limit=int(job["evaluation"]["limit"]),
-                split=str(job["evaluation"]["split"]),
+                split=str(job.get("monitoring_split", job["evaluation"]["split"])),
             )
         health_history.append(health)
         update += 1
@@ -1004,6 +1005,7 @@ def train_candidate_job(job_path: str | Path) -> dict[str, Any]:
         for row in health_history
         if "heldout_behavior" in row
     ]
+    summary["monitoring_split"] = job.get("monitoring_split", job["evaluation"]["split"])
     prior = [_read_json(path) for path in sorted(candidate_dir.glob("metrics-*.json"))]
     curve = sorted(
         [{"generated_tokens": row["generated_tokens"], "behavioral_accuracy": row["behavioral_accuracy"]} for row in prior]
