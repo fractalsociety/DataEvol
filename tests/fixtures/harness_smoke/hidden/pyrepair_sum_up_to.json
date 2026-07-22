@@ -1,0 +1,6 @@
+{
+  "hidden_tests": [
+    "assert sum_up_to(1) == 1\n",
+    "assert sum_up_to(0) == 0\n"
+  ]
+}

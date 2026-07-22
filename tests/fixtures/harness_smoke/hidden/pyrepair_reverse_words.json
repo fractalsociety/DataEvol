@@ -1,0 +1,6 @@
+{
+  "hidden_tests": [
+    "assert reverse_words('a b c') == 'c b a'\n",
+    "assert reverse_words('one') == 'one'\n"
+  ]
+}

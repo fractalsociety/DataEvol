@@ -29,6 +29,7 @@ from typing import Any, Mapping, Sequence
 from dataevol.benchmarks import build_frozen_benchmark
 from dataevol.config import DataEvolConfig
 from dataevol.experiments.workflow import create_rollback_snapshot
+from dataevol.promotion.gate import PromotionRejected
 from dataevol.storage import init_db
 
 from . import storage as harness_storage
@@ -37,7 +38,7 @@ from .genome import HarnessGenome
 from .model_client import ModelClient
 from .promotion import HarnessPromotionDecision, HarnessPromotionGate, HarnessPromotionThresholds
 from .records import ExperimentRecord, LineageNode
-from .scoring import ScoreWeights, bootstrap_ci
+from .scoring import ScoreWeights, bootstrap_ci, median
 from .specialists import (
     BenchmarkBuilder,
     ExperimentJudge,
@@ -138,6 +139,14 @@ def _reproducible_runs(incumbent_eval: Mapping[str, Any], challenger_eval: Mappi
     return sum(1 for a, b in zip(inc, chal) if float(b) > float(a))
 
 
+def _median_quality_delta(incumbent_eval: Any, challenger_eval: Any) -> float:
+    incumbent_runs = list(incumbent_eval.raw.get("per_run_quality") or [])
+    challenger_runs = list(challenger_eval.raw.get("per_run_quality") or [])
+    if incumbent_runs and challenger_runs:
+        return median(challenger_runs) - median(incumbent_runs)
+    return challenger_eval.quality - incumbent_eval.quality
+
+
 def run_harness_evolution(
     task_spec: Mapping[str, Any],
     *,
@@ -197,12 +206,18 @@ def run_harness_evolution(
     )
 
     # --- initial incumbent --------------------------------------------------
-    incumbent = architect.design(task_spec)
-    harness_storage.register_genome(db_path, _genome_with_hash(incumbent), task_id)
+    stored_incumbent = harness_storage.load_incumbent(db_path, task_id=task_id)
+    if stored_incumbent is not None:
+        incumbent = HarnessGenome.from_dict(stored_incumbent)
+    else:
+        incumbent = architect.design(task_spec)
+        harness_storage.register_genome(db_path, _genome_with_hash(incumbent), task_id)
     incumbent_eval = executor.evaluate(incumbent, benchmark_eval_target, seed=evolution.seed, repeated_runs=evolution.repeated_runs, weights=weights)
     harness_storage.register_evaluation(db_path, incumbent_eval.to_dict(), benchmark_id=benchmark_id)
     harness_storage.set_incumbent(db_path, incumbent.genome_id, task_id)
-    rollback_snapshot = create_rollback_snapshot("harness", _short(incumbent.genome_id), output_dir / "rollbacks")
+    rollback_snapshot = create_rollback_snapshot(
+        "harness", _short(incumbent.genome_id), output_dir / "rollbacks", state=incumbent.to_dict()
+    )
 
     lineage: list[LineageNode] = []
     hall_of_fame: list[HarnessGenome] = [incumbent]
@@ -264,7 +279,7 @@ def run_harness_evolution(
             samples=evolution.bootstrap_samples, confidence=evolution.bootstrap_confidence,
             seed=evolution.seed + generation,
         )
-        median_quality_improved = challenger_eval.quality - incumbent_eval.quality
+        median_quality_improved = _median_quality_delta(incumbent_eval, challenger_eval)
         critical = _critical_regressions(incumbent_eval.to_dict(), challenger_eval.to_dict(), evolution.max_critical_benchmark_drop)
         cost_delta = (challenger_eval.cost - incumbent_eval.cost) / incumbent_eval.cost if incumbent_eval.cost else 0.0
         failure_rate_delta = challenger_eval.failure_rate - incumbent_eval.failure_rate
@@ -306,6 +321,26 @@ def run_harness_evolution(
         }
         decision: HarnessPromotionDecision = gate.evaluate(report)
         promoted = decision.promoted
+        next_rollback_snapshot: Path | None = None
+        promotion_path: Path | None = None
+        checkpoint_path: Path | None = None
+        if promoted:
+            try:
+                promotion_result = gate.promote(report, output_dir / "promotions")
+                promotion_path = promotion_result.promotion_path
+                next_rollback_snapshot = create_rollback_snapshot(
+                    "harness", _short(challenger.genome_id), output_dir / "rollbacks", state=challenger.to_dict()
+                )
+                checkpoint_path = output_dir / "checkpoints" / f"incumbent_{challenger.genome_id}.json"
+                checkpoint_path.write_text(
+                    json.dumps(challenger.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+                )
+            except (OSError, PromotionRejected, TypeError, ValueError) as exc:
+                promoted = False
+                decision = HarnessPromotionDecision(False, [f"promotion artifact write failed: {exc}"])
+                for staged_path in (promotion_path, next_rollback_snapshot, checkpoint_path):
+                    if staged_path is not None:
+                        staged_path.unlink(missing_ok=True)
 
         harness_storage.register_experiment(db_path, {
             "incumbent_genome_id": incumbent.genome_id,
@@ -360,15 +395,9 @@ def run_harness_evolution(
         harness_storage.register_training_record(db_path, record.to_dict())
 
         if promoted:
-            try:
-                gate.promote(report, output_dir / "promotions")
-            except Exception as exc:  # pragma: no cover - defensive
-                log.warning("promotion write failed: %s", exc)
-            # snapshot the new incumbent before replacing
-            rollback_snapshot = create_rollback_snapshot("harness", _short(challenger.genome_id), output_dir / "rollbacks")
-            report["rollback_snapshot"] = str(rollback_snapshot)
-            checkpoint_path = output_dir / "checkpoints" / f"incumbent_{challenger.genome_id}.json"
-            checkpoint_path.write_text(json.dumps(challenger.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+            if next_rollback_snapshot is None:  # pragma: no cover - guarded by artifact staging
+                raise RuntimeError("promotion staged without a rollback snapshot")
+            rollback_snapshot = next_rollback_snapshot
             incumbent = challenger
             incumbent_eval = challenger_eval
             harness_storage.set_incumbent(db_path, incumbent.genome_id, task_id)

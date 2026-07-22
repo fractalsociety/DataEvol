@@ -1,0 +1,14 @@
+{
+  "expected_records": [
+    {
+      "sku": "AX100",
+      "qty": 4,
+      "price": 9.99
+    },
+    {
+      "sku": "CT330",
+      "qty": 2,
+      "price": 3.25
+    }
+  ]
+}

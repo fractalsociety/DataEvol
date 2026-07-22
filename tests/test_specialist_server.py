@@ -8,9 +8,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dataevol.config import DataEvolConfig
-from dataevol.local_models.layer_specialist import FREEZE_STRATEGY, SCHEMA, _flatten_params, _layer_parameters
+from dataevol.local_models.layer_specialist import FREEZE_STRATEGY, SCHEMA, _flatten_params, _layer_parameters, candidate_content_hash
 from dataevol.specialist_server.app import create_server_app
+from dataevol.specialist_server.model_host import ModelHost
 from dataevol.specialist_server.swapper import MlxLayerSwapper, sha256_file
+
+
+TEST_MODEL_HASH = "a" * 64
+TEST_MODEL_REVISION = "b" * 40
 
 
 def test_specialist_server_health_and_auth(tmp_path: Path) -> None:
@@ -21,6 +26,22 @@ def test_specialist_server_health_and_auth(tmp_path: Path) -> None:
 
     unauthorized = client.post("/model/load", json={"payload": {"base_model": "x"}})
     assert unauthorized.status_code == 401
+
+
+def test_model_host_passes_remote_revision_to_mlx_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+    mlx_lm = __import__("mlx_lm")
+    model = _tiny_model()
+
+    def fake_load(model_id: str, **kwargs):  # noqa: ANN003
+        calls.append((model_id, kwargs))
+        return model, object()
+
+    monkeypatch.setattr(mlx_lm, "load", fake_load)
+    host = ModelHost()
+    status = host.load("org/remote-model", base_model_revision="f" * 40)
+    assert calls == [("org/remote-model", {"revision": "f" * 40})]
+    assert status["base_model_revision"] == "f" * 40
 
 
 def test_specialist_server_lifecycle_generate_and_chat_contract(tmp_path: Path) -> None:
@@ -106,6 +127,7 @@ def test_specialist_server_loads_manifest_and_tensors_from_urls(tmp_path: Path, 
     body = loaded.json()
     assert body["ok"] is True
     assert body["verified"] is True
+    assert body["manifest"]["name"] == "tiny__compression__L1"
     assert body["manifest_path"].endswith("manifest.json")
     registered_path = Path(body["manifest_path"])
     assert registered_path.exists()
@@ -150,7 +172,7 @@ def test_specialist_server_posts_trait_telemetry_when_enabled(tmp_path: Path, mo
 def test_mlx_swapper_validates_activates_restores_and_switches_layers(tmp_path: Path) -> None:
     mx = pytest.importorskip("mlx.core")
     model = _tiny_model()
-    swapper = MlxLayerSwapper(model, base_model_id="tiny-qwen", base_model_hash=None, num_layers=2)
+    swapper = MlxLayerSwapper(model, base_model_id="tiny-qwen", base_model_hash=TEST_MODEL_HASH, base_model_revision=TEST_MODEL_REVISION, num_layers=2)
     before = _digests(mx, model)
 
     l1_manifest = _write_specialist(tmp_path, mx, model, layer_index=1, name="tiny__compression__L1")
@@ -177,11 +199,15 @@ def test_mlx_swapper_validates_activates_restores_and_switches_layers(tmp_path: 
     assert all(".layers.0." in name for name in changed_after_switch)
     assert swapper.active == "tiny__compression__L0"
 
+    assert swapper.activate_for_task("missing-task") is None
+    assert swapper.active is None
+    assert _digests(mx, model) == before
+
 
 def test_mlx_swapper_rejects_bad_manifest_and_tensor_shape(tmp_path: Path) -> None:
     mx = pytest.importorskip("mlx.core")
     model = _tiny_model()
-    swapper = MlxLayerSwapper(model, base_model_id="tiny-qwen", base_model_hash=None, num_layers=2)
+    swapper = MlxLayerSwapper(model, base_model_id="tiny-qwen", base_model_hash=TEST_MODEL_HASH, base_model_revision=TEST_MODEL_REVISION, num_layers=2)
 
     bad_schema = _write_specialist(tmp_path, mx, model, layer_index=1, name="bad-schema", schema="wrong")
     with pytest.raises(ValueError, match="unsupported schema"):
@@ -190,6 +216,115 @@ def test_mlx_swapper_rejects_bad_manifest_and_tensor_shape(tmp_path: Path) -> No
     bad_shape = _write_specialist(tmp_path, mx, model, layer_index=1, name="bad-shape", wrong_shape=True)
     with pytest.raises(ValueError, match="incompatible"):
         swapper.register(bad_shape)
+
+    wrong_model = _write_specialist(tmp_path, mx, model, layer_index=1, name="wrong-model")
+    manifest = json.loads(wrong_model.read_text(encoding="utf-8"))
+    manifest["base_model_hash"] = "c" * 64
+    wrong_model.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        swapper.register(wrong_model)
+
+    missing_hash = _write_specialist(tmp_path, mx, model, layer_index=1, name="missing-hash")
+    manifest = json.loads(missing_hash.read_text(encoding="utf-8"))
+    manifest["sha256"] = {}
+    missing_hash.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256"):
+        swapper.register(missing_hash)
+
+
+def test_mlx_swapper_casts_float_tensors_and_rolls_back_failed_activation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mx = pytest.importorskip("mlx.core")
+    model = _tiny_model()
+    before = _digests(mx, model)
+    manifest_path = _write_specialist(tmp_path, mx, model, layer_index=1, name="cast-and-rollback")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tensors = mx.load(manifest_path.parent / manifest["tensor_files"][0])
+    cast_tensors = {name: value.astype(mx.float16) for name, value in tensors.items()}
+    swapper = MlxLayerSwapper(model, base_model_id="tiny-qwen", base_model_hash=TEST_MODEL_HASH, base_model_revision=TEST_MODEL_REVISION, num_layers=2)
+    loaded = swapper.register(manifest_path, tensors=cast_tensors)
+    assert loaded.dtype_cast is True
+    assert all(str(value.dtype) == str(_layer_parameters(model, 1)[name].dtype) for name, value in swapper.tensors[loaded.name].items())
+
+    materializations = 0
+    original_materialize = swapper._materialize
+
+    def fail_once() -> None:
+        nonlocal materializations
+        materializations += 1
+        if materializations == 1:
+            raise RuntimeError("materialization failed")
+        original_materialize()
+
+    monkeypatch.setattr(swapper, "_materialize", fail_once)
+    with pytest.raises(RuntimeError, match="materialization failed"):
+        swapper.activate(loaded.name)
+    assert swapper.active is None
+    assert _digests(mx, model) == before
+
+
+def test_route_activation_requires_matching_candidate_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mx = pytest.importorskip("mlx.core")
+    model = _tiny_model()
+    manifest_path = _write_specialist(tmp_path, mx, model, layer_index=1, name="identity-bound")
+    swapper = MlxLayerSwapper(
+        model,
+        base_model_id="tiny-qwen",
+        base_model_hash=TEST_MODEL_HASH,
+        base_model_revision=TEST_MODEL_REVISION,
+        num_layers=2,
+    )
+    record = swapper.register(manifest_path)
+    # The identity contract is under test here; the model was intentionally built
+    # outside TestClient's event-loop thread, unlike production model loading.
+    monkeypatch.setattr(swapper, "_materialize", lambda: None)
+    host = _FakeHost()
+    host.model = model
+    host.base_model = "tiny-qwen"
+    host.swapper = swapper
+    client = TestClient(create_server_app(_cfg(tmp_path), host=host))
+    headers = {"Authorization": "Bearer secret"}
+
+    missing = client.post("/routes/activate", headers=headers, json={"payload": {"name": record.name}})
+    assert missing.status_code == 409
+    mismatch = client.post("/routes/activate", headers=headers, json={"payload": {
+        "name": record.name,
+        "genome_id": record.genome_id,
+        "candidate_content_hash": "0" * 64,
+        "harness_deployment_id": "deploy-1",
+        "verdict_hash": "e" * 64,
+    }})
+    assert mismatch.status_code == 409
+    activated = client.post("/routes/activate", headers=headers, json={"payload": {
+        "name": record.name,
+        "genome_id": record.genome_id,
+        "candidate_content_hash": record.candidate_content_hash,
+        "harness_deployment_id": "deploy-1",
+        "verdict_hash": "e" * 64,
+    }})
+    assert activated.status_code == 200
+    assert activated.json()["binding"]["harness_deployment_id"] == "deploy-1"
+    assert activated.json()["genome_id"] == record.genome_id
+    assert activated.json()["candidate_content_hash"] == record.candidate_content_hash
+    bypass = client.post("/generate", headers=headers, json={"payload": {
+        "prompt": "x",
+        "specialist": "not-authority-bound",
+    }})
+    assert bypass.status_code == 422
+    assert swapper.active == record.name
+    generated = client.post("/generate", headers=headers, json={"payload": {
+        "prompt": "x",
+        "specialist": record.name,
+    }})
+    assert generated.status_code == 200
+    assert generated.json()["specialist"] == record.name
+    deactivated = client.post("/routes/deactivate", headers=headers, json={"payload": {}})
+    assert deactivated.status_code == 200
+    assert swapper.active is None
+    after_deactivate = client.post("/generate", headers=headers, json={"payload": {
+        "prompt": "x",
+        "specialist": record.name,
+    }})
+    assert after_deactivate.status_code == 422
 
 
 def _tiny_model():
@@ -238,16 +373,23 @@ def _write_specialist(
         "schema": schema,
         "name": name,
         "base_model_id": "tiny-qwen",
-        "base_model_hash": None,
+        "base_model_hash": TEST_MODEL_HASH,
+        "base_model_revision": TEST_MODEL_REVISION,
+        "base_model_fingerprint": {"sha256": TEST_MODEL_HASH},
         "layer_index": layer_index,
         "task_type": "compression",
         "training_mode": "sft",
         "freeze_strategy": FREEZE_STRATEGY,
         "tensor_files": [tensor_name],
         "sha256": {tensor_name: sha256_file(out / tensor_name)},
+        "dataset_hash": "d" * 64,
+        "contribution_profile_id": None,
+        "contribution_profile_hash": None,
         "trainable_param_names": list(params),
         "param_shapes": {key: {"shape": list(value.shape), "dtype": str(value.dtype)} for key, value in params.items()},
     }
+    manifest["candidate_content_hash"] = candidate_content_hash(manifest)
+    manifest["genome_id"] = f"layerspecialist_{manifest['candidate_content_hash'][:24]}"
     manifest_path = out / f"{name}.manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return manifest_path

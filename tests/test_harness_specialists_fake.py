@@ -59,6 +59,22 @@ def test_failure_analyst_returns_earliest_cause():
     assert "VERIFICATION_FAILURE" in FAILURE_TAXONOMY
 
 
+def test_failure_analyst_does_not_expose_hidden_holdout_metrics():
+    client = FakeModelClient()
+    evaluation = _eval()
+    evaluation = HarnessEvaluation(
+        **{
+            **evaluation.__dict__,
+            "per_category": {
+                **evaluation.per_category,
+                "hidden_holdout": {"quality": 0.0, "failure_rate": 1.0, "count": 1},
+            },
+        }
+    )
+    FailureAnalyst(client).analyze(_genome(), evaluation)
+    assert "hidden_holdout" not in client.calls[-1]["user"]
+
+
 def test_mutator_proposes_and_apply_mutation_merges_patch():
     patch = {
         "agents": [

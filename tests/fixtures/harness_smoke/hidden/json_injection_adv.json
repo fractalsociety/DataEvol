@@ -1,0 +1,12 @@
+{
+  "expected_records": [
+    {
+      "user": "Kay",
+      "score": 71
+    },
+    {
+      "user": "Omar",
+      "score": 58
+    }
+  ]
+}

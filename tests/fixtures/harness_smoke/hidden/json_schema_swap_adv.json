@@ -1,0 +1,12 @@
+{
+  "expected_records": [
+    {
+      "ref": "R1",
+      "amount": 200
+    },
+    {
+      "ref": "R3",
+      "amount": 75
+    }
+  ]
+}

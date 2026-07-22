@@ -1,0 +1,12 @@
+{
+  "expected_records": [
+    {
+      "item": "Gizmo",
+      "price": 89.0
+    },
+    {
+      "item": "Widget",
+      "price": 1234.5
+    }
+  ]
+}

@@ -47,18 +47,22 @@ def create_server_app(config: DataEvolConfig | None = None, host: ModelHost | No
         }
 
     @app.post("/model/load", dependencies=[protected])
-    def model_load(request: OperationRequest) -> dict[str, Any]:
+    async def model_load(request: OperationRequest) -> dict[str, Any]:
         locked()
         try:
             base_model = str(request.payload.get("base_model") or request.payload.get("model") or "mlx-community/Qwen3-0.6B-4bit")
-            return {"ok": True, **model_host.load(base_model, max_specialists=int(request.payload.get("max_specialists") or 8))}
+            revision = str(request.payload.get("base_model_revision") or "").strip() or None
+            load_options: dict[str, Any] = {"max_specialists": int(request.payload.get("max_specialists") or 8)}
+            if revision:
+                load_options["base_model_revision"] = revision
+            return {"ok": True, **model_host.load(base_model, **load_options)}
         except Exception as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             state_lock.release()
 
     @app.post("/model/unload", dependencies=[protected])
-    def model_unload() -> dict[str, Any]:
+    async def model_unload() -> dict[str, Any]:
         locked()
         try:
             return {"ok": True, **model_host.unload()}
@@ -66,14 +70,15 @@ def create_server_app(config: DataEvolConfig | None = None, host: ModelHost | No
             state_lock.release()
 
     @app.post("/specialists/load", dependencies=[protected])
-    def specialists_load(request: OperationRequest) -> dict[str, Any]:
+    async def specialists_load(request: OperationRequest) -> dict[str, Any]:
         if model_host.swapper is None:
             raise HTTPException(status_code=409, detail="model not loaded")
         locked()
         try:
             manifest_path = _specialist_manifest_path(request.payload, cfg)
             record = model_host.swapper.register(manifest_path)
-            return {"ok": True, **record.__dict__}
+            manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            return {"ok": True, **record.__dict__, "manifest": manifest}
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
@@ -86,7 +91,7 @@ def create_server_app(config: DataEvolConfig | None = None, host: ModelHost | No
         return model_host.swapper.list() if model_host.swapper else []
 
     @app.post("/specialists/unload", dependencies=[protected])
-    def specialists_unload(request: OperationRequest) -> dict[str, Any]:
+    async def specialists_unload(request: OperationRequest) -> dict[str, Any]:
         if model_host.swapper is None:
             raise HTTPException(status_code=409, detail="model not loaded")
         locked()
@@ -99,21 +104,30 @@ def create_server_app(config: DataEvolConfig | None = None, host: ModelHost | No
             state_lock.release()
 
     @app.post("/routes/activate", dependencies=[protected])
-    def route_activate(request: OperationRequest) -> dict[str, Any]:
+    async def route_activate(request: OperationRequest) -> dict[str, Any]:
         if model_host.swapper is None:
             raise HTTPException(status_code=409, detail="model not loaded")
         locked()
         try:
             name = request.payload.get("name")
-            record = model_host.swapper.activate(str(name)) if name else model_host.swapper.activate_for_task(str(request.payload.get("task_type") or ""))
-            return {"ok": True, "activated": record.name if record else None, "fallback": "base" if record is None else None}
+            record = _activate_bound_specialist(model_host, request.payload, name=str(name) if name else None)
+            binding = model_host.swapper.active_binding if model_host.swapper else None
+            return {
+                "ok": True,
+                "activated": record.name if record else None,
+                "fallback": "base" if record is None else None,
+                "binding": binding,
+                **(binding or {}),
+            }
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         finally:
             state_lock.release()
 
     @app.post("/routes/deactivate", dependencies=[protected])
-    def route_deactivate() -> dict[str, Any]:
+    async def route_deactivate() -> dict[str, Any]:
         if model_host.swapper is None:
             raise HTTPException(status_code=409, detail="model not loaded")
         locked()
@@ -124,20 +138,18 @@ def create_server_app(config: DataEvolConfig | None = None, host: ModelHost | No
             state_lock.release()
 
     @app.post("/generate", dependencies=[protected])
-    def generate(request: OperationRequest) -> dict[str, Any]:
+    async def generate(request: OperationRequest) -> dict[str, Any]:
         if model_host.model is None:
             raise HTTPException(status_code=409, detail="model not loaded")
         locked()
         try:
             selected = _select_specialist(model_host, request.payload)
+            active = model_host.swapper.registry.get(model_host.swapper.active) if model_host.swapper and model_host.swapper.active else None
             body = model_host.generate(
                 str(request.payload.get("prompt") or ""),
                 max_tokens=int(request.payload.get("max_tokens") or 128),
                 temperature=float(request.payload.get("temperature") or 0.0),
             )
-            active = model_host.swapper.registry.get(model_host.swapper.active) if model_host.swapper and model_host.swapper.active else None
-            if request.payload.get("restore_after") is True and model_host.swapper:
-                model_host.swapper.restore_base()
             _post_trait_telemetry(model_host, request.payload, body, active)
             return {
                 "ok": True,
@@ -155,12 +167,12 @@ def create_server_app(config: DataEvolConfig | None = None, host: ModelHost | No
             state_lock.release()
 
     @app.post("/v1/chat/completions", dependencies=[protected])
-    def chat_completions(request: dict[str, Any]) -> dict[str, Any]:
+    async def chat_completions(request: dict[str, Any]) -> dict[str, Any]:
         if request.get("stream") is True:
             raise HTTPException(status_code=400, detail="streaming is not supported in phase 2")
         messages = request.get("messages") or []
         prompt = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages if isinstance(m, dict))
-        result = generate(OperationRequest(payload={
+        result = await generate(OperationRequest(payload={
             "prompt": prompt,
             "specialist": request.get("specialist"),
             "max_tokens": request.get("max_tokens") or 128,
@@ -184,12 +196,61 @@ def create_server_app(config: DataEvolConfig | None = None, host: ModelHost | No
 def _select_specialist(host: ModelHost, payload: dict[str, Any]) -> str:
     if not host.swapper:
         return "base"
-    if payload.get("specialist"):
-        return host.swapper.activate(str(payload["specialist"])).name
-    if payload.get("task_type"):
-        record = host.swapper.activate_for_task(str(payload["task_type"]))
-        return record.name if record else "base"
-    return host.swapper.active or "base"
+    requested_name = str(payload.get("specialist") or "").strip()
+    requested_task = str(payload.get("task_type") or "").strip()
+    if not host.swapper.active or not host.swapper.active_binding:
+        if requested_name or requested_task:
+            raise ValueError("specialist route has not been authority-activated")
+        return "base"
+    record = host.swapper.registry.get(host.swapper.active)
+    if record is None:
+        raise ValueError("active specialist is not registered")
+    if requested_name and requested_name != record.name:
+        raise ValueError("requested specialist does not match the authority-bound route")
+    if requested_task and requested_task != record.task_type:
+        raise ValueError("requested task_type does not match the authority-bound route")
+    for field in ("genome_id", "candidate_content_hash", "harness_deployment_id", "verdict_hash"):
+        value = payload.get(field)
+        if value is not None and str(value) != str(host.swapper.active_binding.get(field) or ""):
+            raise ValueError(f"{field} does not match the authority-bound route")
+    return record.name
+
+
+def _activate_bound_specialist(host: ModelHost, payload: dict[str, Any], *, name: str | None = None):
+    if not host.swapper:
+        raise RuntimeError("model not loaded")
+    if name:
+        if name not in host.swapper.registry:
+            raise KeyError(f"unknown specialist: {name}")
+        record = host.swapper.registry[name]
+    else:
+        task_type = str(payload.get("task_type") or "")
+        record = next((item for item in host.swapper.registry.values() if item.task_type == task_type), None)
+        if record is None:
+            host.swapper.restore_base()
+            return None
+    expected_genome_id = str(payload.get("genome_id") or "")
+    expected_content_hash = str(payload.get("candidate_content_hash") or "").lower()
+    deployment_id = str(payload.get("harness_deployment_id") or "").strip()
+    verdict_hash = str(payload.get("verdict_hash") or "").lower()
+    if not expected_genome_id or not expected_content_hash or not deployment_id or not verdict_hash:
+        raise ValueError("genome_id, candidate_content_hash, harness_deployment_id, and verdict_hash are required for specialist activation")
+    if len(expected_content_hash) != 64 or any(ch not in "0123456789abcdef" for ch in expected_content_hash):
+        raise ValueError("candidate_content_hash must be a 64-character hexadecimal digest")
+    if len(verdict_hash) != 64 or any(ch not in "0123456789abcdef" for ch in verdict_hash):
+        raise ValueError("verdict_hash must be a 64-character hexadecimal digest")
+    if record.genome_id != expected_genome_id:
+        raise ValueError("specialist genome_id mismatch")
+    if record.candidate_content_hash != expected_content_hash:
+        raise ValueError("specialist candidate_content_hash mismatch")
+    activated = host.swapper.activate(record.name)
+    host.swapper.active_binding = {
+        "genome_id": record.genome_id,
+        "candidate_content_hash": record.candidate_content_hash,
+        "harness_deployment_id": deployment_id,
+        "verdict_hash": verdict_hash,
+    }
+    return activated
 
 
 def _guard_manifest_path(raw: str, cfg: DataEvolConfig) -> Path:

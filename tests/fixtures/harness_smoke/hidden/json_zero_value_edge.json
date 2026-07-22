@@ -1,0 +1,12 @@
+{
+  "expected_records": [
+    {
+      "code": "A1",
+      "qty": 0
+    },
+    {
+      "code": "A3",
+      "qty": 5
+    }
+  ]
+}

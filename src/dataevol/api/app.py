@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -22,10 +23,14 @@ from pydantic import BaseModel, Field
 from dataevol import __version__
 from dataevol.compat import call_core
 from dataevol.api.auth import require_token
+from dataevol.api.training_job_store import initialize_training_jobs, jobs_for_db, persist_training_job
 from dataevol.config import DataEvolConfig, load_config
 from dataevol.local_models import EXPERTS, prepare_local_adapter_training
 from dataevol.local_models.layer_specialist import SCHEMA as LAYER_SPECIALIST_SCHEMA
 from dataevol.local_models.layer_specialist import build_manifest as build_layer_specialist_manifest
+from dataevol.local_models.layer_specialist import model_fingerprint
+from dataevol.local_models.layer_specialist import validate_initial_specialist_manifest
+from dataevol.local_models.remote_dataset import materialize_layer_dataset
 from dataevol.rlmf import (
     build_benchmark_fixture,
     build_mlx_lora_manifest,
@@ -42,6 +47,8 @@ ORNITH_9B_MODEL_PATH = ".dataevol/models/Ornith-1.0-9B-8bit"
 DEFAULT_DASHBOARD_OUTPUT = ".dataevol/qwen3_0_6b_experts"
 TRAINING_JOBS: dict[str, dict[str, Any]] = {}
 TRAINING_JOBS_LOCK = threading.Lock()
+TRAINING_PROCESSES: dict[str, subprocess.Popen[str]] = {}
+TRAINING_CANCEL_EVENTS: dict[str, threading.Event] = {}
 ITERATION_RE = re.compile(r"\bIter\s+(\d+)\s*:")
 MAX_ADAPTER_EXPORT_FILE_BYTES = 25 * 1024 * 1024
 ADAPTER_EXPORT_FILES = {
@@ -101,7 +108,7 @@ def _training_job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
     snapshot = {
         key: value
         for key, value in job.items()
-        if key not in {"logs"}
+        if key != "logs" and not key.startswith("_")
     }
     snapshot["logs"] = list(job.get("logs") or [])
     snapshot["elapsed_seconds"] = elapsed
@@ -206,7 +213,7 @@ def _export_layer_specialists(output: Path) -> tuple[dict[str, Any], int, list[s
     if not root.exists():
         return specialists, count, hashes
     for layer_dir in sorted(path for path in root.glob("layer_*") if path.is_dir()):
-        manifest_record = None
+        manifest_records: list[dict[str, Any]] = []
         tensor_records: list[dict[str, Any]] = []
         for path in sorted(layer_dir.glob("*")):
             if not path.is_file():
@@ -222,17 +229,22 @@ def _export_layer_specialists(output: Path) -> tuple[dict[str, Any], int, list[s
                     "content_base64": base64.b64encode(data).decode("ascii"),
                 }
                 hashes.append(manifest_record["sha256"])
+                manifest_records.append(manifest_record)
                 count += 1
             elif path.suffix == ".safetensors":
                 size = path.stat().st_size
                 if size > MAX_ADAPTER_EXPORT_FILE_BYTES:
-                    tensor_records.append({
+                    record = {
                         "relative_path": relative,
                         "path": str(path),
                         "size_bytes": size,
-                        "skipped": True,
-                        "reason": "file_too_large",
-                    })
+                        "sha256": _sha256_path(path),
+                        "content_omitted": True,
+                        "reason": "use_artifact_file_endpoint",
+                    }
+                    tensor_records.append(record)
+                    hashes.append(record["sha256"])
+                    count += 1
                     continue
                 data = path.read_bytes()
                 record = {
@@ -247,23 +259,57 @@ def _export_layer_specialists(output: Path) -> tuple[dict[str, Any], int, list[s
                 count += 1
         specialists[layer_dir.name] = {
             "path": str(layer_dir),
-            "exists": manifest_record is not None or bool(tensor_records),
-            "manifest": manifest_record,
+            "exists": bool(manifest_records) or bool(tensor_records),
+            "manifest": manifest_records[0] if manifest_records else None,
+            "manifests": manifest_records,
             "tensors": tensor_records,
         }
     return specialists, count, hashes
 
 
-def _validate_train_layer_specialist(payload: dict[str, Any]) -> dict[str, Any]:
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_train_layer_specialist(payload: dict[str, Any], cfg: DataEvolConfig) -> dict[str, Any]:
     layer_index = _non_negative_int(payload.get("layer_index"), "layer_index")
     training_mode = str(payload.get("training_mode") or "").strip()
     if training_mode not in {"sft", "rl"}:
         raise HTTPException(status_code=422, detail="training_mode must be sft or rl")
+    rl_algorithm = _optional_string(payload.get("rl_algorithm"))
+    if training_mode == "rl" and rl_algorithm != "dpo":
+        raise HTTPException(status_code=422, detail="training_mode=rl requires supported rl_algorithm=dpo")
+    if training_mode == "sft" and rl_algorithm is not None:
+        raise HTTPException(status_code=422, detail="rl_algorithm is only valid when training_mode=rl")
     base_model = _required_string(payload.get("base_model") or payload.get("model"), "base_model")
+    base_model_revision = _optional_string(payload.get("base_model_revision"))
     output = _required_string(payload.get("output"), "output")
     task_type = _required_string(payload.get("task_type"), "task_type")
     dataset_uri = _required_string(payload.get("dataset_uri") or payload.get("dataset"), "dataset_uri")
-    dataset_path = _resolve_local_dataset_uri(dataset_uri)
+    try:
+        dataset = materialize_layer_dataset(
+            dataset_uri,
+            expected_sha256=_optional_string(payload.get("dataset_sha256")),
+            artifacts_root=cfg.artifacts_path,
+        )
+        fingerprint = model_fingerprint(base_model, base_model_revision=base_model_revision)
+        initial_specialist_manifest = _optional_string(payload.get("initial_specialist_manifest"))
+        initial_specialist = None
+        if initial_specialist_manifest is not None:
+            if training_mode != "rl":
+                raise ValueError("initial_specialist_manifest is only valid when training_mode=rl")
+            initial_specialist = validate_initial_specialist_manifest(
+                initial_specialist_manifest,
+                base_model=base_model,
+                base_model_revision=base_model_revision,
+                layer_index=layer_index,
+            )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     output_path = _safe_output_path(output)
     contribution = _optional_float(payload.get("contribution"), "contribution")
     min_contribution = _positive_float(payload.get("min_contribution", 0.5), "min_contribution")
@@ -274,22 +320,38 @@ def _validate_train_layer_specialist(payload: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail=f"contribution {contribution} below min_contribution {min_contribution}")
     normalized = {
         "base_model": base_model,
+        "base_model_revision": fingerprint.get("resolved_revision"),
+        "base_model_hash": fingerprint["sha256"],
         "output": str(output_path),
         "task_type": task_type,
         "training_mode": training_mode,
+        "rl_algorithm": rl_algorithm,
         "layer_index": layer_index,
-        "dataset_uri": str(dataset_path),
+        "dataset_uri": str(dataset.path),
+        "dataset_source_uri": dataset.source_uri,
+        "dataset_sha256": dataset.sha256,
         "execute": bool(payload.get("execute", True)),
         "learning_rate": _positive_float(payload.get("learning_rate", 1e-5), "learning_rate"),
         "batch_size": max(1, _positive_int(payload.get("batch_size", 1), "batch_size")),
         "max_steps": _positive_int(payload.get("max_steps", 100), "max_steps"),
         "seed": _int_value(payload.get("seed", 17), "seed"),
         "eval_split": _eval_split(payload.get("eval_split", 0.1)),
-        "max_seq_len": _positive_int(payload.get("max_seq_len", payload.get("max_sequence_length", 512)), "max_seq_len"),
+        "beta": _positive_float(payload.get("beta", 0.1), "beta"),
+        "sft_coef": _non_negative_float(payload.get("sft_coef", 0.0), "sft_coef"),
+        "max_seq_len": _positive_int(
+            payload.get("max_seq_len", payload.get("max_seq_length", payload.get("max_sequence_length", 512))),
+            "max_seq_len",
+        ),
         "min_contribution": min_contribution,
         "contribution": contribution,
         "contribution_profile_id": _optional_string(payload.get("contribution_profile_id")),
         "contribution_profile_hash": _optional_string(payload.get("contribution_profile_hash")),
+        "genome_id": _optional_string(payload.get("genome_id")),
+        "initial_specialist_manifest": initial_specialist["path"] if initial_specialist else None,
+        "initial_specialist_candidate_content_hash": (
+            initial_specialist["manifest"]["candidate_content_hash"] if initial_specialist else None
+        ),
+        "timeout_seconds": _positive_float(payload.get("timeout_seconds", payload.get("timeout", 7200)), "timeout_seconds"),
     }
     return normalized
 
@@ -303,11 +365,21 @@ def _plan_train_layer_specialist(payload: dict[str, Any]) -> dict[str, Any]:
         "dry_run": True,
         "schema": LAYER_SPECIALIST_SCHEMA,
         "base_model": payload["base_model"],
+        "base_model_revision": payload.get("base_model_revision"),
+        "base_model_hash": payload["base_model_hash"],
         "output": payload["output"],
         "layer_index": payload["layer_index"],
         "task_type": payload["task_type"],
         "training_mode": payload["training_mode"],
+        "rl_algorithm": payload.get("rl_algorithm"),
+        "beta": payload["beta"],
+        "sft_coef": payload["sft_coef"],
+        "initial_specialist_manifest": payload.get("initial_specialist_manifest"),
+        "initial_specialist_candidate_content_hash": payload.get("initial_specialist_candidate_content_hash"),
         "dataset_uri": payload["dataset_uri"],
+        "dataset_source_uri": payload["dataset_source_uri"],
+        "dataset_sha256": payload["dataset_sha256"],
+        "timeout_seconds": payload["timeout_seconds"],
         "freeze_strategy": "mlx_full_layer",
         "planned_command": command,
         "acceptance_criteria": {
@@ -318,9 +390,18 @@ def _plan_train_layer_specialist(payload: dict[str, Any]) -> dict[str, Any]:
                 "schema",
                 "base_model_id",
                 "base_model_hash",
+                "base_model_revision",
+                "base_model_fingerprint",
+                "genome_id",
+                "candidate_content_hash",
                 "layer_index",
                 "task_type",
                 "training_mode",
+                *(
+                    ["rl_algorithm", "objective", "initial_policy", "parent_candidate_content_hash"]
+                    if payload["training_mode"] == "rl"
+                    else []
+                ),
                 "freeze_strategy",
                 "dataset_uri",
                 "dataset_hash",
@@ -364,9 +445,10 @@ def _run_layer_specialist_job(job_id: str, payload: dict[str, Any]) -> None:
             bufsize=1,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
-        assert proc.stdout is not None
         final_json: dict[str, Any] | None = None
-        for line in proc.stdout:
+
+        def handle_line(line: str) -> None:
+            nonlocal final_json
             _append_training_log(job_id, line)
             parsed = _maybe_json(line)
             if parsed:
@@ -376,11 +458,37 @@ def _run_layer_specialist_job(job_id: str, payload: dict[str, Any]) -> None:
                 step = int(match.group(1))
                 progress = min(0.95, step / max(1, int(payload["max_steps"])))
                 _update_training_job(job_id, current_step=step, progress=progress)
-        returncode = proc.wait()
+
+        returncode = _stream_training_process(
+            job_id,
+            proc,
+            timeout_seconds=float(payload["timeout_seconds"]),
+            on_line=handle_line,
+        )
         if returncode != 0:
             raise RuntimeError(f"layer specialist training exited with return code {returncode}")
-        manifest_path = final_json.get("manifest_path") if final_json else None
-        manifest = _read_json_file(manifest_path) if manifest_path else None
+        if not final_json or final_json.get("status") != "completed" or not final_json.get("manifest_path"):
+            raise RuntimeError("layer specialist training exited without a completed manifest")
+        manifest_path = str(final_json["manifest_path"])
+        manifest_file = Path(manifest_path).resolve()
+        if not manifest_file.is_file() or Path(output).resolve() not in manifest_file.parents:
+            raise RuntimeError("layer specialist training returned an invalid manifest path")
+        manifest = _read_json_file(manifest_file)
+        if not isinstance(manifest, dict) or manifest.get("schema") != LAYER_SPECIALIST_SCHEMA:
+            raise RuntimeError("layer specialist training returned an invalid manifest")
+        if manifest.get("training_mode") != payload["training_mode"]:
+            raise RuntimeError("layer specialist training returned the wrong training_mode")
+        if manifest.get("rl_algorithm") != payload.get("rl_algorithm"):
+            raise RuntimeError("layer specialist training returned the wrong rl_algorithm")
+        if manifest.get("parent_candidate_content_hash") != payload.get("initial_specialist_candidate_content_hash"):
+            raise RuntimeError("layer specialist training returned the wrong initial policy identity")
+        for tensor_file in manifest.get("tensor_files") or []:
+            tensor_path = (manifest_file.parent / str(tensor_file)).resolve()
+            expected_hash = (manifest.get("sha256") or {}).get(str(tensor_file))
+            if manifest_file.parent not in tensor_path.parents or not tensor_path.is_file():
+                raise RuntimeError(f"layer specialist tensor is missing or unsafe: {tensor_file}")
+            if not expected_hash or _sha256_path(tensor_path) != expected_hash:
+                raise RuntimeError(f"layer specialist tensor hash mismatch: {tensor_file}")
         _update_training_job(
             job_id,
             status="completed",
@@ -391,8 +499,11 @@ def _run_layer_specialist_job(job_id: str, payload: dict[str, Any]) -> None:
             manifest=manifest,
         )
         _append_training_log(job_id, "Layer specialist training job completed.")
+    except _TrainingCancelled as exc:
+        _update_training_job(job_id, status="cancelled", completed_at=time.time(), progress=1.0, ok=False, recoverable=True, error=str(exc))
+        _append_training_log(job_id, f"Cancelled: {exc}")
     except Exception as exc:  # pragma: no cover - exercised by host runner runtime.
-        _update_training_job(job_id, status="failed", completed_at=time.time(), progress=1.0, ok=False, error=str(exc))
+        _update_training_job(job_id, status="failed", completed_at=time.time(), progress=1.0, ok=False, recoverable=True, error=str(exc))
         _append_training_log(job_id, f"Failed: {exc}")
 
 
@@ -414,6 +525,11 @@ def _layer_specialist_command(payload: dict[str, Any]) -> list[str]:
         str(payload["task_type"]),
         "--training-mode",
         str(payload["training_mode"]),
+        *(_optional_arg("--rl-algorithm", payload.get("rl_algorithm"))),
+        "--beta",
+        str(payload["beta"]),
+        "--sft-coef",
+        str(payload["sft_coef"]),
         "--learning-rate",
         str(payload["learning_rate"]),
         "--batch-size",
@@ -428,6 +544,11 @@ def _layer_specialist_command(payload: dict[str, Any]) -> list[str]:
         str(payload["seed"]),
         *(_optional_arg("--contribution-profile-id", payload.get("contribution_profile_id"))),
         *(_optional_arg("--contribution-profile-hash", payload.get("contribution_profile_hash"))),
+        *(_optional_arg("--contribution", payload.get("contribution"))),
+        *(_optional_arg("--dataset-source-uri", payload.get("dataset_source_uri"))),
+        *(_optional_arg("--base-model-revision", payload.get("base_model_revision"))),
+        *(_optional_arg("--genome-id", payload.get("genome_id"))),
+        *(_optional_arg("--initial-specialist-manifest", payload.get("initial_specialist_manifest"))),
     ]
 
 
@@ -529,6 +650,13 @@ def _positive_float(value: Any, field: str) -> float:
     return n
 
 
+def _non_negative_float(value: Any, field: str) -> float:
+    n = _float_value(value, field)
+    if n < 0:
+        raise HTTPException(status_code=422, detail=f"{field} must be non-negative")
+    return n
+
+
 def _float_value(value: Any, field: str) -> float:
     try:
         n = float(value)
@@ -552,6 +680,7 @@ def _update_training_job(job_id: str, **updates: Any) -> dict[str, Any] | None:
         if job is None:
             return None
         job.update(updates)
+        persist_training_job(job)
         return job
 
 
@@ -563,6 +692,162 @@ def _append_training_log(job_id: str, line: str) -> None:
         job = TRAINING_JOBS.get(job_id)
         if job is not None:
             job["logs"].append(text)
+            persist_training_job(job)
+
+
+class _TrainingCancelled(RuntimeError):
+    pass
+
+
+def _stream_training_process(
+    job_id: str,
+    proc: subprocess.Popen[str],
+    *,
+    timeout_seconds: float,
+    on_line,
+) -> int:
+    if proc.stdout is None:
+        raise RuntimeError("training subprocess stdout is unavailable")
+    output: queue.Queue[str | None] = queue.Queue()
+
+    def read_output() -> None:
+        try:
+            for line in proc.stdout:
+                output.put(line)
+        finally:
+            output.put(None)
+
+    reader = threading.Thread(target=read_output, name=f"training-output-{job_id}", daemon=True)
+    reader.start()
+    cancel_event = TRAINING_CANCEL_EVENTS.setdefault(job_id, threading.Event())
+    with TRAINING_JOBS_LOCK:
+        TRAINING_PROCESSES[job_id] = proc
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        output_closed = False
+        while True:
+            if cancel_event.is_set():
+                _terminate_process(proc)
+                raise _TrainingCancelled("training job was cancelled")
+            if time.monotonic() >= deadline:
+                _terminate_process(proc)
+                raise TimeoutError(f"training job exceeded timeout of {timeout_seconds:g} seconds")
+            if output_closed:
+                returncode = proc.poll()
+                if returncode is not None:
+                    return returncode
+                time.sleep(min(0.05, max(0.01, deadline - time.monotonic())))
+                continue
+            try:
+                line = output.get(timeout=min(0.25, max(0.01, deadline - time.monotonic())))
+            except queue.Empty:
+                if proc.poll() is not None and not reader.is_alive():
+                    return int(proc.returncode or 0)
+                continue
+            if line is None:
+                output_closed = True
+            else:
+                on_line(line)
+    finally:
+        with TRAINING_JOBS_LOCK:
+            TRAINING_PROCESSES.pop(job_id, None)
+        reader.join(timeout=1.0)
+
+
+def _terminate_process(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=max(0.1, float(os.environ.get("LAYER_SPECIALIST_TERMINATE_GRACE_S", "5"))))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def _layer_training_job(job_id: str, payload: dict[str, Any], cfg: DataEvolConfig, *, retry_of: str | None = None) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "job_type": "layerscope_train_layer_specialist",
+        "status": "queued",
+        "created_at": time.time(),
+        "started_at": None,
+        "completed_at": None,
+        "progress": 0.0,
+        "percent": 0.0,
+        "layer_index": payload["layer_index"],
+        "task_type": payload["task_type"],
+        "training_mode": payload["training_mode"],
+        "rl_algorithm": payload.get("rl_algorithm"),
+        "manifest_path": None,
+        "error": None,
+        "recoverable": False,
+        "retry_of": retry_of,
+        "normalized_payload": dict(payload),
+        "logs": deque(maxlen=160),
+        "_db_path": str(Path(cfg.db_path).resolve()),
+    }
+
+
+def _dashboard_training_job(
+    job_id: str,
+    payload: dict[str, Any],
+    cfg: DataEvolConfig,
+    *,
+    retry_of: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "job_type": "local_model_training",
+        "status": "queued",
+        "created_at": time.time(),
+        "started_at": None,
+        "completed_at": None,
+        "progress": 0.0,
+        "percent": 0.0,
+        "current_expert": None,
+        "current_iter": 0,
+        "completed_experts": 0,
+        "total_experts": 0,
+        "total_iters": 0,
+        "gpu_device_factor": float(payload.get("gpu_device_factor") or os.environ.get("DATAEVOL_GPU_DEVICE_FACTOR") or 1.0),
+        "manifest_path": None,
+        "script_path": None,
+        "error": None,
+        "recoverable": False,
+        "retry_of": retry_of,
+        "normalized_payload": dict(payload),
+        "logs": deque(maxlen=160),
+        "_db_path": str(Path(cfg.db_path).resolve()),
+    }
+
+
+def _start_layer_training_job(job: dict[str, Any]) -> None:
+    job_id = str(job["job_id"])
+    payload = dict(job["normalized_payload"])
+    TRAINING_CANCEL_EVENTS[job_id] = threading.Event()
+    thread = threading.Thread(
+        target=_run_layer_specialist_job,
+        args=(job_id, payload),
+        name=f"dataevol-specialist-{job_id}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _start_dashboard_training_job(job: dict[str, Any]) -> None:
+    job_id = str(job["job_id"])
+    payload = dict(job["normalized_payload"])
+    TRAINING_CANCEL_EVENTS[job_id] = threading.Event()
+    thread = threading.Thread(
+        target=_run_dashboard_training_job,
+        args=(job_id, payload),
+        name=f"dataevol-training-{job_id}",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _run_dashboard_training_job(job_id: str, payload: dict[str, Any]) -> None:
@@ -608,7 +893,6 @@ def _run_dashboard_training_job(job_id: str, payload: dict[str, Any]) -> None:
             )
             _append_training_log(job_id, f"Starting {job.expert}: {' '.join(job.command)}")
             env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-            started_at = time.time()
             proc = subprocess.Popen(
                 job.command,
                 stdout=subprocess.PIPE,
@@ -617,18 +901,20 @@ def _run_dashboard_training_job(job_id: str, payload: dict[str, Any]) -> None:
                 bufsize=1,
                 env=env,
             )
-            assert proc.stdout is not None
-            for line in proc.stdout:
+            def handle_line(line: str) -> None:
                 _append_training_log(job_id, line)
                 match = ITERATION_RE.search(line)
                 if match:
                     current_iter = min(iters, max(0, int(match.group(1))))
                     progress = ((completed_experts * iters) + current_iter) / total_iters
                     _update_training_job(job_id, current_iter=current_iter, progress=progress)
-                if time.time() - started_at > timeout:
-                    proc.kill()
-                    raise TimeoutError(f"{job.expert} exceeded timeout of {timeout} seconds")
-            returncode = proc.wait()
+
+            returncode = _stream_training_process(
+                job_id,
+                proc,
+                timeout_seconds=float(timeout),
+                on_line=handle_line,
+            )
             if returncode != 0:
                 raise RuntimeError(f"{job.expert} training exited with return code {returncode}")
             completed_experts += 1
@@ -649,12 +935,23 @@ def _run_dashboard_training_job(job_id: str, payload: dict[str, Any]) -> None:
             ok=True,
         )
         _append_training_log(job_id, "Training job completed.")
+    except _TrainingCancelled as exc:
+        _update_training_job(
+            job_id,
+            status="cancelled",
+            completed_at=time.time(),
+            ok=False,
+            recoverable=True,
+            error=str(exc),
+        )
+        _append_training_log(job_id, f"Cancelled: {exc}")
     except Exception as exc:  # pragma: no cover - exercised through dashboard runtime
         _update_training_job(
             job_id,
             status="failed",
             completed_at=time.time(),
             ok=False,
+            recoverable=True,
             error=str(exc),
         )
         _append_training_log(job_id, f"Failed: {exc}")
@@ -662,6 +959,10 @@ def _run_dashboard_training_job(job_id: str, payload: dict[str, Any]) -> None:
 
 def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     cfg = config or load_config()
+    recovered_jobs = initialize_training_jobs(cfg.db_path)
+    with TRAINING_JOBS_LOCK:
+        for recovered_job in recovered_jobs:
+            TRAINING_JOBS[str(recovered_job["job_id"])] = recovered_job
     app = FastAPI(title="DataEvol API", version=__version__)
     protected = Depends(require_token(cfg))
 
@@ -842,35 +1143,11 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     @app.post("/local_model/training/start", dependencies=[protected])
     def local_model_training_start(request: OperationRequest) -> dict[str, Any]:
         job_id = uuid.uuid4().hex[:12]
-        job = {
-            "ok": True,
-            "job_id": job_id,
-            "status": "queued",
-            "created_at": time.time(),
-            "started_at": None,
-            "completed_at": None,
-            "progress": 0.0,
-            "percent": 0.0,
-            "current_expert": None,
-            "current_iter": 0,
-            "completed_experts": 0,
-            "total_experts": 0,
-            "total_iters": 0,
-            "gpu_device_factor": float(request.payload.get("gpu_device_factor") or os.environ.get("DATAEVOL_GPU_DEVICE_FACTOR") or 1.0),
-            "manifest_path": None,
-            "script_path": None,
-            "error": None,
-            "logs": deque(maxlen=160),
-        }
+        job = _dashboard_training_job(job_id, dict(request.payload), cfg)
         with TRAINING_JOBS_LOCK:
             TRAINING_JOBS[job_id] = job
-        thread = threading.Thread(
-            target=_run_dashboard_training_job,
-            args=(job_id, dict(request.payload)),
-            name=f"dataevol-training-{job_id}",
-            daemon=True,
-        )
-        thread.start()
+            persist_training_job(job)
+        _start_dashboard_training_job(job)
         return _training_job_snapshot(job)
 
     @app.post("/local_model/training/status", dependencies=[protected])
@@ -880,50 +1157,84 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Missing training job id.")
         with TRAINING_JOBS_LOCK:
             job = TRAINING_JOBS.get(str(job_id))
-            if job is None:
+            if job is None or str(Path(str(job.get("_db_path") or "")).resolve()) != str(Path(cfg.db_path).resolve()):
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown training job id.")
             return _training_job_snapshot(job)
 
     @app.post("/local_model/training/latest", dependencies=[protected])
     def local_model_training_latest(request: OperationRequest) -> dict[str, Any]:
         with TRAINING_JOBS_LOCK:
-            if not TRAINING_JOBS:
+            configured_jobs = jobs_for_db(TRAINING_JOBS.values(), cfg.db_path)
+            if not configured_jobs:
                 return {"ok": True, "status": "idle", "job_id": None, "logs": []}
-            job = max(TRAINING_JOBS.values(), key=lambda item: item.get("created_at") or 0)
+            job = max(configured_jobs, key=lambda item: item.get("created_at") or 0)
             return _training_job_snapshot(job)
+
+    @app.post("/local_model/training/cancel", dependencies=[protected])
+    def local_model_training_cancel(request: OperationRequest) -> dict[str, Any]:
+        job_id = str(request.payload.get("job_id") or "")
+        with TRAINING_JOBS_LOCK:
+            job = TRAINING_JOBS.get(job_id)
+            if job is None or str(Path(str(job.get("_db_path") or "")).resolve()) != str(Path(cfg.db_path).resolve()):
+                raise HTTPException(status_code=404, detail="Unknown training job id.")
+            if job.get("status") not in {"queued", "running"}:
+                return _training_job_snapshot(job)
+            event = TRAINING_CANCEL_EVENTS.setdefault(job_id, threading.Event())
+            event.set()
+            proc = TRAINING_PROCESSES.get(job_id)
+        if proc is not None:
+            _terminate_process(proc)
+        updated = _update_training_job(
+            job_id,
+            status="cancelled",
+            completed_at=time.time(),
+            ok=False,
+            recoverable=True,
+            error="training job was cancelled",
+        )
+        return _training_job_snapshot(updated or job)
+
+    @app.post("/local_model/training/retry", dependencies=[protected])
+    def local_model_training_retry(request: OperationRequest) -> dict[str, Any]:
+        source_id = str(request.payload.get("job_id") or "")
+        with TRAINING_JOBS_LOCK:
+            source = TRAINING_JOBS.get(source_id)
+            if source is None or str(Path(str(source.get("_db_path") or "")).resolve()) != str(Path(cfg.db_path).resolve()):
+                raise HTTPException(status_code=404, detail="Unknown training job id.")
+            if source.get("job_type") not in {"layerscope_train_layer_specialist", "local_model_training"} or not source.get("recoverable"):
+                raise HTTPException(status_code=409, detail="Training job is not recoverable.")
+            existing_retry_id = source.get("retry_job_id")
+            if existing_retry_id and existing_retry_id in TRAINING_JOBS:
+                return _training_job_snapshot(TRAINING_JOBS[existing_retry_id])
+            normalized_payload = source.get("normalized_payload")
+            if not isinstance(normalized_payload, dict):
+                raise HTTPException(status_code=409, detail="Recoverable job has no normalized payload.")
+            retry_id = uuid.uuid4().hex[:12]
+            if source.get("job_type") == "layerscope_train_layer_specialist":
+                retry_job = _layer_training_job(retry_id, dict(normalized_payload), cfg, retry_of=source_id)
+            else:
+                retry_job = _dashboard_training_job(retry_id, dict(normalized_payload), cfg, retry_of=source_id)
+            TRAINING_JOBS[retry_id] = retry_job
+            source["retry_job_id"] = retry_id
+            persist_training_job(source)
+            persist_training_job(retry_job)
+        if retry_job["job_type"] == "layerscope_train_layer_specialist":
+            _start_layer_training_job(retry_job)
+        else:
+            _start_dashboard_training_job(retry_job)
+        return _training_job_snapshot(retry_job)
 
     @app.post("/local_model/layerscope/train_layer_specialist", dependencies=[protected])
     def local_model_layerscope_train_layer_specialist(request: OperationRequest) -> dict[str, Any]:
-        payload = _validate_train_layer_specialist(request.payload)
+        payload = _validate_train_layer_specialist(request.payload, cfg)
         if not payload.get("execute", True):
             return _plan_train_layer_specialist(payload)
         job_id = uuid.uuid4().hex[:12]
-        job = {
-            "ok": True,
-            "job_id": job_id,
-            "job_type": "layerscope_train_layer_specialist",
-            "status": "queued",
-            "created_at": time.time(),
-            "started_at": None,
-            "completed_at": None,
-            "progress": 0.0,
-            "percent": 0.0,
-            "layer_index": payload["layer_index"],
-            "task_type": payload["task_type"],
-            "training_mode": payload["training_mode"],
-            "manifest_path": None,
-            "error": None,
-            "logs": deque(maxlen=160),
-        }
+        job = _layer_training_job(job_id, payload, cfg)
         with TRAINING_JOBS_LOCK:
             TRAINING_JOBS[job_id] = job
-        thread = threading.Thread(
-            target=_run_layer_specialist_job,
-            args=(job_id, dict(payload)),
-            name=f"dataevol-specialist-{job_id}",
-            daemon=True,
-        )
-        thread.start()
+            persist_training_job(job)
+        _start_layer_training_job(job)
         return _training_job_snapshot(job)
 
     @app.post("/rlmf/prepare", dependencies=[protected])
@@ -1006,11 +1317,27 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
         return call_core("reports", "promotions", {}, config=cfg)
 
     # --- Harness Evolver ----------------------------------------------------
-    for _harness_op in ("design", "benchmark", "evaluate", "failures", "mutate", "judge", "evolve"):
+    for _harness_op in (
+        "design", "benchmark", "evaluate", "failures", "mutate", "judge", "evolve",
+        "compile", "register_compiled", "route_compiled", "start_execution",
+        "execution_action", "execution_observation", "export_next_actions",
+    ):
 
         @app.post(f"/harness/{_harness_op}", dependencies=[protected], name=f"harness_{_harness_op}")
         def _harness_endpoint(request: OperationRequest, _op: str = _harness_op) -> dict[str, Any]:
             return call_core("harness", _op, request.payload, config=cfg)
+
+    @app.post("/harness/verdict", dependencies=[protected])
+    def harness_verdict(request: dict[str, Any]) -> dict[str, Any]:
+        payload = request.get("payload") if isinstance(request.get("payload"), dict) else request
+        return call_core("harness", "verdict", payload, config=cfg)
+
+    @app.get("/harness/verdicts/{verdict_id}", dependencies=[protected])
+    def harness_get_verdict(verdict_id: str) -> dict[str, Any]:
+        result = call_core("harness", "get_verdict", {"verdict_id": verdict_id}, config=cfg)
+        if result.get("status") == "not_found":
+            raise HTTPException(status_code=404, detail=f"harness verdict not found: {verdict_id}")
+        return result
 
     @app.get("/harness/lineage")
     def harness_lineage() -> dict[str, Any]:
@@ -1023,6 +1350,26 @@ def create_app(config: DataEvolConfig | None = None) -> FastAPI:
     @app.get("/harness/training_records")
     def harness_training_records() -> dict[str, Any]:
         return call_core("harness", "training_records", {}, config=cfg)
+
+    @app.get("/harness/compiled", dependencies=[protected])
+    def harness_compiled_registry(
+        status_filter: str | None = Query(default=None, alias="status"),
+        category: str | None = None,
+    ) -> dict[str, Any]:
+        return call_core(
+            "harness", "compiled_registry", {"status": status_filter, "category": category}, config=cfg
+        )
+
+    @app.get("/harness/executions/{session_id}", dependencies=[protected])
+    def harness_execution(session_id: str) -> dict[str, Any]:
+        result = call_core("harness", "get_execution", {"session_id": session_id}, config=cfg)
+        if result.get("status") == "not_found":
+            raise HTTPException(status_code=404, detail=f"harness execution not found: {session_id}")
+        return result
+
+    @app.get("/harness/execution_metrics", dependencies=[protected])
+    def harness_execution_metrics(session_id: str | None = None) -> dict[str, Any]:
+        return call_core("harness", "execution_metrics", {"session_id": session_id}, config=cfg)
 
     return app
 

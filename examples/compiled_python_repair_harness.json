@@ -1,0 +1,96 @@
+{
+  "schema": "dataevol.compiled_harness.v1",
+  "harness_id": "python-test-first-repair",
+  "version": 1,
+  "category": "python_repair",
+  "goal": "Repair one reproducible Python failure and leave verified evidence.",
+  "triggers": {
+    "task_types": ["code_repair"],
+    "languages": ["python"],
+    "error_classes": ["test_failure"],
+    "repository_paths": ["src/", "tests/"],
+    "required_tools": ["test", "search", "read", "edit"],
+    "risk_levels": ["low", "medium"],
+    "keywords": ["failing test", "traceback", "python"]
+  },
+  "steps": [
+    {
+      "step_id": "reproduce",
+      "action_type": "tool",
+      "tool": "test",
+      "arguments": {"target": "$dynamic"},
+      "requires": [],
+      "produces": ["failure_reproduced"],
+      "max_attempts": 2
+    },
+    {
+      "step_id": "locate",
+      "action_type": "tool",
+      "tool": "search",
+      "arguments": {"query": "$dynamic"},
+      "requires": ["failure_reproduced"],
+      "produces": ["source_located"],
+      "max_attempts": 2
+    },
+    {
+      "step_id": "inspect",
+      "action_type": "tool",
+      "tool": "read",
+      "arguments": {"path": "$dynamic"},
+      "requires": ["source_located"],
+      "produces": ["incorrect_assumption_identified"],
+      "max_attempts": 2
+    },
+    {
+      "step_id": "patch",
+      "action_type": "tool",
+      "tool": "edit",
+      "arguments": {"path": "$dynamic"},
+      "requires": ["incorrect_assumption_identified"],
+      "produces": ["patch_written"],
+      "max_attempts": 1
+    },
+    {
+      "step_id": "verify_target",
+      "action_type": "tool",
+      "tool": "test",
+      "arguments": {"target": "$dynamic"},
+      "requires": ["patch_written"],
+      "produces": ["target_test_passed"],
+      "max_attempts": 2,
+      "on_failure": "inspect"
+    },
+    {
+      "step_id": "verify_related",
+      "action_type": "tool",
+      "tool": "test",
+      "arguments": {"target": "$dynamic"},
+      "requires": ["target_test_passed"],
+      "produces": ["related_tests_passed"],
+      "max_attempts": 1
+    },
+    {
+      "step_id": "complete",
+      "action_type": "complete",
+      "requires": ["related_tests_passed"],
+      "produces": [],
+      "max_attempts": 1
+    }
+  ],
+  "invariants": {
+    "allowed_tools": ["test", "search", "read", "edit"],
+    "allowed_path_prefixes": ["src", "tests"],
+    "tool_requirements": {
+      "edit": ["failure_reproduced", "incorrect_assumption_identified"]
+    },
+    "required_evidence": ["target_test_report", "related_test_report", "patch_hash"],
+    "max_total_actions": 12,
+    "max_failures_before_escalation": 2,
+    "high_risk_requires_teacher": true
+  },
+  "status": "active",
+  "provenance": {
+    "kind": "human_seed",
+    "purpose": "Stage-S0 controller and distillation smoke tests"
+  }
+}

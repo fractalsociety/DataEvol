@@ -1,0 +1,6 @@
+{
+  "hidden_tests": [
+    "assert fib(0) == 0\n",
+    "assert fib(7) == 13\n"
+  ]
+}

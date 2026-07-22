@@ -1,0 +1,6 @@
+{
+  "hidden_tests": [
+    "assert clamp(-5, 0, 10) == 0\n",
+    "assert clamp(15, 0, 10) == 10\n"
+  ]
+}

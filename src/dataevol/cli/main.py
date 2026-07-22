@@ -518,6 +518,87 @@ def harness_training_records(config: Annotated[Path | None, typer.Option("--conf
     _print_result(call_core("harness", "training_records", {}, config=load_config(config)))
 
 
+@harness_app.command("register-compiled")
+def harness_register_compiled(
+    harness: Annotated[str, typer.Option("--harness", help="Compiled harness JSON or path.")],
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Validate and immutably register a typed harness."""
+    _print_result(call_core("harness", "register_compiled", {"harness": harness}, config=load_config(config)))
+
+
+@harness_app.command("route")
+def harness_route(
+    features: Annotated[str, typer.Option("--features", help="Task feature JSON or path.")],
+    top_k: Annotated[int, typer.Option("--top-k", min=1, max=3)] = 3,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Route a task to at most three compiled harnesses without an LLM call."""
+    _print_result(call_core(
+        "harness", "route_compiled", {"features": _json_option(features), "top_k": top_k}, config=load_config(config)
+    ))
+
+
+@harness_app.command("start-execution")
+def harness_start_execution(
+    task: Annotated[str, typer.Option("--task", help="Task JSON or path.")],
+    features: Annotated[str | None, typer.Option("--features", help="Optional routing feature JSON or path.")] = None,
+    teacher_selected_harness_id: Annotated[str | None, typer.Option("--teacher-selected-harness-id")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Pin a routed harness and create a persistent controller session."""
+    parsed_task = _json_option(task)
+    _print_result(call_core("harness", "start_execution", {
+        "task": parsed_task,
+        "features": _json_option(features) if features else parsed_task,
+        "teacher_selected_harness_id": teacher_selected_harness_id,
+    }, config=load_config(config)))
+
+
+@harness_app.command("next-action")
+def harness_next_action(
+    session_id: Annotated[str, typer.Option("--session-id")],
+    proposal: Annotated[str, typer.Option("--proposal", help="Worker action JSON or path.")],
+    teacher_correction: Annotated[str | None, typer.Option("--teacher-correction", help="Optional corrected action JSON or path.")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Validate one worker action against controller order and invariants."""
+    _print_result(call_core("harness", "execution_action", {
+        "session_id": session_id,
+        "proposal": _json_option(proposal),
+        "teacher_correction": _json_option(teacher_correction) if teacher_correction else None,
+    }, config=load_config(config)))
+
+
+@harness_app.command("observe")
+def harness_observe(
+    session_id: Annotated[str, typer.Option("--session-id")],
+    success: Annotated[bool, typer.Option("--success/--failure")],
+    evidence: Annotated[str | None, typer.Option("--evidence", help="Evidence JSON or path.")] = None,
+    produced_flags: Annotated[str, typer.Option("--produced-flags", help="Comma-separated state flags.")] = "",
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Record an observation and advance, retry, or escalate the state machine."""
+    _print_result(call_core("harness", "execution_observation", {
+        "session_id": session_id,
+        "success": success,
+        "evidence": _json_option(evidence) if evidence else {},
+        "produced_flags": [item.strip() for item in produced_flags.split(",") if item.strip()],
+    }, config=load_config(config)))
+
+
+@harness_app.command("export-next-actions")
+def harness_export_next_actions(
+    output: Annotated[Path, typer.Option("--output")],
+    session_id: Annotated[str | None, typer.Option("--session-id")] = None,
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Export positive, violation, and teacher-corrected next-action examples."""
+    _print_result(call_core("harness", "export_next_actions", {
+        "output": str(output), "session_id": session_id,
+    }, config=load_config(config)))
+
+
 def main() -> None:
     app()
 

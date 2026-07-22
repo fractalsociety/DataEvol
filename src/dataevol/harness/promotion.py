@@ -10,6 +10,7 @@ recorded as ``decision_reason`` only.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,9 +86,25 @@ class HarnessPromotionGate:
         if reproducible_runs < t.reproducibility_requirement:
             reasons.append(f"reproducibility requirement not met ({reproducible_runs} < {t.reproducibility_requirement})")
 
+        rollback_artifact_hash = report.get("rollback_artifact_hash")
         rollback_snapshot = report.get("rollback_snapshot")
-        if not rollback_snapshot or not Path(str(rollback_snapshot)).exists():
-            reasons.append("rollback snapshot missing")
+        if rollback_artifact_hash is not None:
+            if not isinstance(rollback_artifact_hash, str) or not re.fullmatch(
+                r"[0-9a-fA-F]{64}", rollback_artifact_hash
+            ):
+                reasons.append("rollback artifact hash must be a SHA-256")
+        elif not rollback_snapshot or not Path(str(rollback_snapshot)).is_file():
+            reasons.append("rollback snapshot or durable artifact hash missing")
+        else:
+            try:
+                snapshot = json.loads(Path(str(rollback_snapshot)).read_text(encoding="utf-8"))
+                state = snapshot.get("state") if isinstance(snapshot, Mapping) else None
+                if not isinstance(state, Mapping):
+                    reasons.append("rollback snapshot does not contain restorable state")
+                elif report.get("incumbent_genome_id") and state.get("genome_id") != report.get("incumbent_genome_id"):
+                    reasons.append("rollback snapshot does not match incumbent genome")
+            except (OSError, json.JSONDecodeError):
+                reasons.append("rollback snapshot is unreadable")
 
         return HarnessPromotionDecision(promoted=not reasons, reasons=reasons)
 

@@ -1,0 +1,6 @@
+{
+  "hidden_tests": [
+    "assert is_palindrome('Race car') == True\n",
+    "assert is_palindrome('hello') == False\n"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "hidden_tests": [
+    "assert average([]) == 0\n",
+    "assert average([5]) == 5\n"
+  ]
+}

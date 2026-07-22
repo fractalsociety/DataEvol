@@ -31,6 +31,14 @@ from .scoring import (
     median,
 )
 from .executor import HarnessExecutor, ReferenceExecutor, parallel_evaluate
+from .verdicts import HarnessVerdict, VERDICT_SCHEMA, issue_harness_verdict
+from .compiled import (
+    COMPILED_HARNESS_SCHEMA,
+    CompiledHarness,
+    DeterministicHarnessRouter,
+    ExternalHarnessCompiler,
+)
+from .controller import HarnessExecutionController, HarnessExecutionState
 from . import storage
 
 __all__ = [
@@ -38,7 +46,10 @@ __all__ = [
     "AgentSpec",
     "HarnessExecutor",
     "HarnessEvaluation",
+    "HarnessExecutionController",
+    "HarnessExecutionState",
     "HarnessGenome",
+    "HarnessVerdict",
     "MemorySpec",
     "MutationRecord",
     "OutputSchemaSpec",
@@ -47,8 +58,14 @@ __all__ = [
     "RouterSpec",
     "ScoreWeights",
     "WorkflowStep",
+    "VERDICT_SCHEMA",
+    "COMPILED_HARNESS_SCHEMA",
+    "CompiledHarness",
+    "DeterministicHarnessRouter",
+    "ExternalHarnessCompiler",
     "bootstrap_ci",
     "composite_score",
+    "issue_harness_verdict",
     "new_genome_id",
     "parallel_evaluate",
     "storage",

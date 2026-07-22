@@ -1,0 +1,6 @@
+{
+  "hidden_tests": [
+    "assert double(0) == 0\n",
+    "assert double(-3) == -6\n"
+  ]
+}

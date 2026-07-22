@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -7,6 +8,7 @@ from dataevol.config import DataEvolConfig
 from dataevol.harness import storage as harness_storage
 from dataevol.harness.loop import EvolutionConfig, run_harness_evolution
 from dataevol.harness.model_client import FakeModelClient
+from dataevol.harness.promotion import HarnessPromotionGate
 
 BENCHMARK_CASES = [
     {"id": "n1", "category": "normal"},
@@ -82,6 +84,8 @@ def test_loop_promotes_improving_candidate_and_records_everything(tmp_path: Path
     assert any(row["promoted"] for row in lineage)
     incumbent = harness_storage.load_incumbent(cfg.db_path, task_id=result.task_id)
     assert incumbent is not None and any(a["role"] == "verifier" for a in incumbent["agents"])
+    rollback = json.loads(Path(result.incumbent_rollback_snapshot).read_text(encoding="utf-8"))
+    assert rollback["state"] == result.incumbent.to_dict()
 
     with sqlite3.connect(cfg.db_path) as conn:
         n_exp = conn.execute("SELECT COUNT(*) FROM harness_experiments").fetchone()[0]
@@ -118,3 +122,39 @@ def test_loop_survives_specialist_error_and_continues(tmp_path: Path):
     )
     assert result.generations == 2
     assert result.promotions == 0
+
+
+def test_rerun_resumes_stored_incumbent_instead_of_replacing_it(tmp_path: Path):
+    cfg = _cfg(tmp_path)
+    first = run_harness_evolution(
+        {"task_type": "permit_set_review"},
+        config=cfg,
+        model_client=_client(IMPROVING_PATCH),
+        evolution=EvolutionConfig(max_generations=1, number_of_candidates=1, repeated_runs=3),
+    )
+    second = run_harness_evolution(
+        {"task_type": "permit_set_review"},
+        config=cfg,
+        model_client=_client(NEUTRAL_PATCH),
+        evolution=EvolutionConfig(max_generations=0),
+        benchmark=BENCHMARK_CASES,
+    )
+    assert second.incumbent.genome_id == first.incumbent.genome_id
+
+
+def test_promotion_artifact_failure_does_not_advance_incumbent(tmp_path: Path, monkeypatch):
+    cfg = _cfg(tmp_path)
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(HarnessPromotionGate, "promote", fail_write)
+    result = run_harness_evolution(
+        {"task_type": "permit_set_review"},
+        config=cfg,
+        model_client=_client(IMPROVING_PATCH),
+        evolution=EvolutionConfig(max_generations=1, number_of_candidates=1, repeated_runs=3),
+    )
+    assert result.promotions == 0
+    assert not any(agent.role == "verifier" for agent in result.incumbent.agents)
+    assert harness_storage.load_lineage(cfg.db_path)[-1]["promoted"] is False

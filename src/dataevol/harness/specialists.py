@@ -245,8 +245,7 @@ class FailureAnalyst:
         )
         user = (
             f"genome={json.dumps(genome.semantic_dict(), sort_keys=True)}\n"
-            f"failure_categories={list(evaluation.failure_categories)}\n"
-            f"per_category={ {k: dict(v) for k, v in evaluation.per_category.items()} }"
+            f"per_category={ {k: dict(v) for k, v in evaluation.per_category.items() if k != 'hidden_holdout'} }"
         )
         result = self.client.complete(system=system, user=user, response_format="json", model=self.model, temperature=0.1)
         data = _as_mapping(_parse_json(result["content"], label="failure_analyst"), label="failure_analyst")

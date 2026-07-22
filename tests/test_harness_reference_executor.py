@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from dataevol.harness.executor import ReferenceExecutor
 from dataevol.harness.genome import (
     AgentSpec,
@@ -111,3 +115,32 @@ def test_failure_categories_populated_when_cases_fail():
     assert e.failure_categories  # earliest-causal labels present
     # Evaluation has a to_dict with metrics
     assert "quality" in e.metrics()
+
+
+def test_paired_runs_use_the_same_noise_for_equivalent_capabilities():
+    baseline = _genome()
+    changed_metadata = baseline.with_component(
+        genome_id=new_genome_id(),
+        router=replace(baseline.router, fallback_model="unused-fallback"),
+    )
+    executor = ReferenceExecutor()
+    control = executor.evaluate(baseline, BENCHMARK, seed=11, repeated_runs=5)
+    candidate = executor.evaluate(changed_metadata, BENCHMARK, seed=11, repeated_runs=5)
+    assert candidate.per_run_scores == control.per_run_scores
+
+
+def test_per_category_quality_aggregates_all_repeated_runs():
+    evaluation = ReferenceExecutor().evaluate(_genome(), BENCHMARK, seed=13, repeated_runs=5)
+    total_cases = sum(int(metrics["count"]) for metrics in evaluation.per_category.values())
+    weighted_quality = sum(
+        metrics["quality"] * metrics["count"] for metrics in evaluation.per_category.values()
+    ) / total_cases
+    assert weighted_quality == pytest.approx(evaluation.quality)
+
+
+def test_empty_or_missing_benchmark_fails_closed(tmp_path):
+    executor = ReferenceExecutor()
+    with pytest.raises(ValueError, match="no cases"):
+        executor.evaluate(_genome(), [])
+    with pytest.raises(ValueError, match="no cases"):
+        executor.evaluate(_genome(), tmp_path / "missing.jsonl")

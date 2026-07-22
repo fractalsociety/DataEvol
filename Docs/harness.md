@@ -48,8 +48,9 @@ Without these, model-driven commands return `status: model_not_configured`.
 
 `evaluate`, `lineage`, `incumbent`, and `training-records` need no model — the
 default executor (`ReferenceExecutor`) is a deterministic, in-process capability
-model. A real Docker/subprocess sandbox can later implement the same
-`HarnessExecutor` Protocol and be swapped in.
+model. It is simulation-only: its evidence always produces an `INCONCLUSIVE`
+binding verdict and can never authorize a production canary. A real runtime can
+implement the same `HarnessExecutor` Protocol and submit measured evidence.
 
 ## CLI
 
@@ -64,6 +65,12 @@ dataevol harness judge     --incumbent-eval ./i.json --challenger-eval ./c.json
 dataevol harness lineage
 dataevol harness incumbent
 dataevol harness training-records
+dataevol harness register-compiled --harness ./compiled-harness.json
+dataevol harness route --features ./task-features.json --top-k 3
+dataevol harness start-execution --task ./task.json --features ./task-features.json
+dataevol harness next-action --session-id hexec_... --proposal ./action.json
+dataevol harness observe --session-id hexec_... --success --evidence ./evidence.json
+dataevol harness export-next-actions --output .dataevol/harness/next-actions.jsonl
 ```
 
 ## API
@@ -71,11 +78,68 @@ dataevol harness training-records
 `POST /harness/{design|benchmark|evaluate|failures|mutate|judge|evolve}` (body
 `{"payload": {...}}`, token-protected) and `GET /harness/{lineage|incumbent|training_records}`.
 
+`POST /harness/verdict` issues and persists a binding evaluation verdict from a
+promotion-gate report. `GET /harness/verdicts/{verdict_id}` returns it. Both are
+token-protected. Verdicts are `ELIGIBLE`, `REJECTED`, or `INCONCLUSIVE` and use
+schema `dataevol.harness_verdict.v1`. `ELIGIBLE` authorizes only a FractalWork
+canary; DataEvol does not own `CANARY`, `ACTIVE`, or `ROLLED_BACK` state.
+
+## Compiled harness execution
+
+The external teacher can compile a rich harness with `POST /harness/compile`.
+`POST /harness/register_compiled` validates and immutably stores an already
+compiled manifest. The compact manifest contains typed triggers, ordered tool or
+check steps, state preconditions and effects, branches, retry budgets, tool and
+path permissions, evidence requirements, and a terminal complete/escalate step.
+
+`POST /harness/route_compiled` performs deterministic top-1-to-3 selection. It
+requires teacher selection for high-risk, unmatched, low-confidence, or
+near-boundary routes. `POST /harness/start_execution` pins the chosen content
+hash. The 1B worker then submits one local decision at a time to
+`POST /harness/execution_action`; observations advance the controller through
+`POST /harness/execution_observation`. The controller, not the model, owns order,
+tool guards, allowed paths, retry limits, stop conditions, and evidence floors.
+
+Rejected actions and optional teacher corrections are durable events.
+`POST /harness/export_next_actions` exports both positive and violation-labelled
+examples using `dataevol.next_action_example.v1`. Registry, execution, and
+metrics reads are available at `GET /harness/compiled`,
+`GET /harness/executions/{session_id}`, and `GET /harness/execution_metrics`.
+
+## Codex routing outcome evidence
+
+FractalWork emits `codex.execution_evidence.v1` only after a real routed
+subtask finishes. The receipt pins the executable plan, route decision,
+accounting receipt, catalog, pricing, policy, candidate set, full model revision
+fingerprint, verifier result, cost, latency, retries, tool failures, and safety
+or policy violations.
+
+DataEvol evaluates those receipts with:
+
+```bash
+python -m dataevol.experiments.codex_outcome_pipeline \
+  --outcomes ./fractalwork-execution-evidence.jsonl \
+  --output ./.dataevol/codex-outcomes/epoch-001
+```
+
+The output contains normalized immutable outcomes, capability-cell statistics,
+randomized-only cheapest-acceptable training targets, and a rollout
+recommendation. Synthetic teacher labels never count as capability evidence.
+Low/medium-risk cells require at least 100 independent verified task groups,
+97% selective precision, a 95% Wilson lower bound, calibrated confidence, zero
+serious failures, and no recent regression. High/critical cells remain
+conditional and require independent verification even when statistically
+qualified. Initial authority is `shadow=0%`; the first eligible stage is a
+FractalWork canary capped at 5%.
+
 ## Persistence
 
-Seven tables (migration `002_harness.sql`, applied in sorted order with `001`):
+Harness tables are created by sorted migrations `002`, `003`, and `005`:
 `harness_tasks`, `harness_genomes`, `harness_benchmarks`, `harness_evaluations`,
-`harness_lineage`, `harness_training_records`, `harness_experiments`. Every
+`harness_lineage`, `harness_training_records`, `harness_experiments`, and
+`harness_verdicts`, plus `compiled_harnesses`, `harness_execution_sessions`, and
+`harness_execution_events`. Every
 experiment emits a training record (the JSON shape future fine-tuning will
-consume). Out of scope for v1: the real sandbox executor, the Harness Prior
-Model, and fine-tuning from records — only their seams are present.
+consume). The compiled controller path also emits next-action distillation rows.
+The real sandbox executor, population posterior, and fine-tuning jobs remain
+separate gated milestones.

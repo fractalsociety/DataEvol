@@ -13,6 +13,10 @@ from typing import Any, Mapping
 
 from dataevol.storage import connect, init_db
 
+from .verdicts import HarnessVerdict
+from .compiled import CompiledHarness
+from .controller import HarnessExecutionState
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -231,6 +235,166 @@ def register_experiment(db_path: str | Path, experiment: Mapping[str, Any]) -> i
         return int(cursor.lastrowid)
 
 
+def register_verdict(db_path: str | Path, verdict: HarnessVerdict | Mapping[str, Any]) -> str:
+    """Persist an immutable verdict, allowing only byte-equivalent retries."""
+    init_db(db_path)
+    record = verdict if isinstance(verdict, HarnessVerdict) else HarnessVerdict.from_dict(verdict)
+    if not record.verify_hash():
+        raise ValueError("verdict_hash does not match the canonical verdict payload")
+    data = record.to_dict()
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO harness_verdicts (
+              verdict_id, schema, verdict, task_type, incumbent_genome_id,
+              candidate_genome_id, candidate_content_hash, benchmark_hash,
+              evidence_hash, executor_kind, reasons, created_at, verdict_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.verdict_id,
+                record.schema,
+                record.verdict,
+                record.task_type,
+                record.incumbent_genome_id,
+                record.candidate_genome_id,
+                record.candidate_content_hash,
+                record.benchmark_hash,
+                record.evidence_hash,
+                record.executor_kind,
+                _json(data["reasons"]),
+                record.created_at,
+                record.verdict_hash,
+            ),
+        )
+        existing = conn.execute(
+            "SELECT verdict_hash FROM harness_verdicts WHERE verdict_id = ?", (record.verdict_id,)
+        ).fetchone()
+        if existing is None or existing["verdict_hash"] != record.verdict_hash:
+            raise ValueError(f"verdict_id {record.verdict_id} already exists with different content")
+    return record.verdict_id
+
+
+def register_compiled_harness(db_path: str | Path, harness: CompiledHarness | Mapping[str, Any]) -> str:
+    """Store an immutable compiled harness version and reject conflicting retries."""
+    init_db(db_path)
+    record = harness if isinstance(harness, CompiledHarness) else CompiledHarness.from_dict(harness)
+    payload = record.to_dict()
+    with connect(db_path) as conn:
+        existing = conn.execute(
+            "SELECT content_hash FROM compiled_harnesses WHERE harness_id = ? AND version = ?",
+            (record.harness_id, record.version),
+        ).fetchone()
+        if existing is not None and existing["content_hash"] != record.content_hash:
+            raise ValueError(f"compiled harness {record.harness_id} v{record.version} already exists with different content")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO compiled_harnesses (
+              harness_id, version, category, status, content_hash, parent_id,
+              source_genome_id, manifest_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.harness_id,
+                record.version,
+                record.category,
+                record.status,
+                record.content_hash,
+                record.parent_id,
+                record.source_genome_id,
+                _json(payload),
+                record.created_at,
+            ),
+        )
+    return record.content_hash
+
+
+def create_execution_session(
+    db_path: str | Path,
+    state: HarnessExecutionState,
+    *,
+    task_features: Mapping[str, Any],
+    route_decision: Mapping[str, Any],
+) -> str:
+    init_db(db_path)
+    now = now_iso()
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO harness_execution_sessions (
+              session_id, harness_id, harness_version, harness_content_hash,
+              status, task_features, route_decision, state_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state.session_id,
+                state.harness_id,
+                state.harness_version,
+                state.harness_content_hash,
+                state.status,
+                _json(dict(task_features)),
+                _json(dict(route_decision)),
+                _json(state.to_dict()),
+                now,
+                now,
+            ),
+        )
+    return state.session_id
+
+
+def update_execution_session(db_path: str | Path, state: HarnessExecutionState) -> None:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE harness_execution_sessions
+            SET status = ?, state_json = ?, updated_at = ?
+            WHERE session_id = ? AND harness_content_hash = ?
+            """,
+            (state.status, _json(state.to_dict()), now_iso(), state.session_id, state.harness_content_hash),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("execution session is missing or its pinned harness identity changed")
+
+
+def register_execution_event(db_path: str | Path, event: Mapping[str, Any]) -> int:
+    init_db(db_path)
+    session_id = str(event.get("session_id") or "").strip()
+    if not session_id:
+        raise ValueError("execution event session_id is required")
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(event_index), -1) + 1 AS next_index FROM harness_execution_events WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        event_index = int(row["next_index"])
+        cursor = conn.execute(
+            """
+            INSERT INTO harness_execution_events (
+              session_id, event_index, kind, state_before, proposal, accepted,
+              violations, expected_action, observation, state_after,
+              teacher_correction, verifier, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                event_index,
+                str(event.get("kind") or "action"),
+                _json(dict(event.get("state_before") or {})),
+                _json(dict(event.get("proposal") or {})),
+                None if event.get("accepted") is None else (1 if event.get("accepted") else 0),
+                _json(list(event.get("violations") or [])),
+                _json(dict(event.get("expected_action") or {})),
+                _json(dict(event.get("observation") or {})),
+                _json(dict(event.get("state_after") or {})),
+                _json(dict(event.get("teacher_correction") or {})),
+                _json(dict(event.get("verifier") or {})),
+                now_iso(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
 # --- readers -----------------------------------------------------------------
 
 def load_genome(db_path: str | Path, genome_id: str) -> dict[str, Any] | None:
@@ -238,6 +402,83 @@ def load_genome(db_path: str | Path, genome_id: str) -> dict[str, Any] | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT genome_json FROM harness_genomes WHERE genome_id = ?", (genome_id,)).fetchone()
     return _loads(row["genome_json"], None) if row else None
+
+
+def load_compiled_harness(
+    db_path: str | Path,
+    harness_id: str,
+    version: int | None = None,
+) -> dict[str, Any] | None:
+    init_db(db_path)
+    query = "SELECT manifest_json FROM compiled_harnesses WHERE harness_id = ?"
+    args: tuple[Any, ...] = (harness_id,)
+    if version is not None:
+        query += " AND version = ?"
+        args = (harness_id, version)
+    query += " ORDER BY version DESC LIMIT 1"
+    with connect(db_path) as conn:
+        row = conn.execute(query, args).fetchone()
+    return _loads(row["manifest_json"], None) if row else None
+
+
+def list_compiled_harnesses(
+    db_path: str | Path,
+    *,
+    status: str | None = None,
+    category: str | None = None,
+) -> list[dict[str, Any]]:
+    init_db(db_path)
+    clauses: list[str] = []
+    args: list[Any] = []
+    if status is not None:
+        clauses.append("status = ?")
+        args.append(status)
+    if category is not None:
+        clauses.append("category = ?")
+        args.append(category)
+    query = "SELECT manifest_json FROM compiled_harnesses"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY harness_id ASC, version DESC"
+    with connect(db_path) as conn:
+        rows = conn.execute(query, tuple(args)).fetchall()
+    return [_loads(row["manifest_json"], {}) for row in rows]
+
+
+def load_execution_session(db_path: str | Path, session_id: str) -> dict[str, Any] | None:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM harness_execution_sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    data = dict(row)
+    data["task_features"] = _loads(data.get("task_features"), {})
+    data["route_decision"] = _loads(data.get("route_decision"), {})
+    data["state"] = _loads(data.pop("state_json", None), {})
+    return data
+
+
+def load_execution_events(db_path: str | Path, session_id: str | None = None) -> list[dict[str, Any]]:
+    init_db(db_path)
+    query = "SELECT * FROM harness_execution_events"
+    args: tuple[Any, ...] = ()
+    if session_id is not None:
+        query += " WHERE session_id = ?"
+        args = (session_id,)
+    query += " ORDER BY session_id ASC, event_index ASC"
+    with connect(db_path) as conn:
+        rows = [dict(row) for row in conn.execute(query, args).fetchall()]
+    for row in rows:
+        for key, default in (
+            ("state_before", {}), ("proposal", {}), ("violations", []),
+            ("expected_action", {}), ("observation", {}), ("state_after", {}),
+            ("teacher_correction", {}), ("verifier", {}),
+        ):
+            row[key] = _loads(row.get(key), default)
+        row["accepted"] = None if row.get("accepted") is None else bool(row["accepted"])
+    return rows
 
 
 def load_incumbent(db_path: str | Path, task_id: int | None = None) -> dict[str, Any] | None:
@@ -287,3 +528,14 @@ def load_training_records(db_path: str | Path, genome_id: str | None = None) -> 
         for key in json_keys:
             row[key] = _loads(row.get(key), {})
     return rows
+
+
+def load_verdict(db_path: str | Path, verdict_id: str) -> dict[str, Any] | None:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM harness_verdicts WHERE verdict_id = ?", (verdict_id,)).fetchone()
+    if row is None:
+        return None
+    data = dict(row)
+    data["reasons"] = _loads(data.get("reasons"), [])
+    return HarnessVerdict.from_dict(data).to_dict()

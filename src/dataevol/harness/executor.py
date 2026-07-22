@@ -53,6 +53,11 @@ class _Capabilities:
     prompt_richness: float = 0.0
 
 
+@dataclass(frozen=True)
+class _PreparedBenchmark:
+    cases: tuple[Mapping[str, Any], ...]
+
+
 def _capabilities(genome: HarnessGenome) -> _Capabilities:
     roles = {a.role for a in genome.agents}
     has_verifier = "verifier" in roles or any("verifier" in w.agent_role for w in genome.workflow)
@@ -146,7 +151,7 @@ def _case_pass(genome: HarnessGenome, caps: _Capabilities, category: str) -> tup
     return (True, None)
 
 
-def _benchmark_cases(benchmark: Any) -> list[dict[str, Any]]:
+def _benchmark_cases(benchmark: Any) -> list[Mapping[str, Any]]:
     """Normalize a benchmark (FrozenBenchmark | Path | list[dict] | jsonl str) to case dicts."""
     if isinstance(benchmark, str):
         if benchmark.strip().startswith("[") or benchmark.strip().startswith("{"):
@@ -155,7 +160,7 @@ def _benchmark_cases(benchmark: Any) -> list[dict[str, Any]]:
             return parsed if isinstance(parsed, list) else [parsed]
         return _read_jsonl(Path(benchmark))
     if isinstance(benchmark, list):
-        return [dict(c) for c in benchmark]
+        return [c if isinstance(c, Mapping) else dict(c) for c in benchmark]
     if isinstance(benchmark, Mapping):
         items = benchmark.get("items") or benchmark.get("cases")
         if items:
@@ -213,56 +218,57 @@ class ReferenceExecutor:
     ) -> HarnessEvaluation:
         weights = weights or ScoreWeights()
         caps = _capabilities(genome)
-        cases = _benchmark_cases(benchmark)
+        cases = benchmark.cases if isinstance(benchmark, _PreparedBenchmark) else _benchmark_cases(benchmark)
         if not cases:
-            cases = [{"id": "synthetic_default", "category": "normal"}]
+            raise ValueError("benchmark contains no cases")
 
         run_metrics: list[dict[str, float]] = []
-        per_category_acc: dict[str, dict[str, float]] = {}
         failure_categories_ordered: list[str] = []
+        case_outcomes: list[tuple[str, bool, str | None]] = []
+        category_counts: dict[str, int] = {}
+        for case in cases:
+            category = str(case.get("category") or case.get("benchmark_type") or "normal").lower()
+            passed, label = _case_pass(genome, caps, category)
+            case_outcomes.append((category, passed, label))
+            category_counts[category] = category_counts.get(category, 0) + 1
+        per_category_totals = {
+            category: {"quality": 0.0, "failed": 0.0} for category in category_counts
+        }
+
+        robustness = caps_robustness(caps)
+        verifier_agreement = caps_verifier(caps)
 
         for run_index in range(max(1, repeated_runs)):
-            rng = random.Random((seed * 1000 + run_index) ^ _stable_hash(genome.content_hash()))
+            # Common random numbers make incumbent/challenger comparisons truly
+            # paired: the same seed and case position receive the same jitter.
+            rng = random.Random(seed * 1000 + run_index)
             correctness_sum = 0.0
             failed = 0
-            cat_quality: dict[str, list[float]] = {}
-            cat_failed: dict[str, int] = {}
-            cat_count: dict[str, int] = {}
-            for case in cases:
-                category = (case.get("category") or case.get("benchmark_type") or "normal").lower()
-                cat_count[category] = cat_count.get(category, 0) + 1
-                passed, label = _case_pass(genome, caps, category)
+            for category, passed, label in case_outcomes:
                 # small deterministic jitter so repeated runs vary slightly
                 jitter = (rng.random() - 0.5) * 0.04
                 if passed:
                     correctness = max(0.0, min(1.0, caps.base_quality + jitter))
-                    cat_quality.setdefault(category, []).append(correctness)
                 else:
                     correctness = caps.base_quality * 0.4
                     failed += 1
-                    cat_failed[category] = cat_failed.get(category, 0) + 1
-                    cat_quality.setdefault(category, []).append(correctness)
                     if label and label not in failure_categories_ordered:
                         failure_categories_ordered.append(label)
                 correctness_sum += correctness
+                totals = per_category_totals[category]
+                totals["quality"] += correctness
+                totals["failed"] += float(not passed)
             n = len(cases)
             run_q = correctness_sum / n
             run_f = failed / n
             run_metrics.append({
                 "quality": run_q,
-                "robustness": caps_robustness(caps),
-                "verifier_agreement": caps_verifier(caps),
+                "robustness": robustness,
+                "verifier_agreement": verifier_agreement,
                 "cost": caps.per_task_cost,
                 "latency": caps.per_task_latency,
                 "failure_rate": run_f,
             })
-            # accumulate per-category from the last run (category outcomes are structurally stable)
-            for category, vals in cat_quality.items():
-                per_category_acc[category] = {
-                    "quality": sum(vals) / len(vals),
-                    "failure_rate": cat_failed.get(category, 0) / max(1, cat_count.get(category, len(vals))),
-                    "count": cat_count.get(category, len(vals)),
-                }
 
         # aggregate across runs
         def _mean(key: str) -> float:
@@ -271,6 +277,14 @@ class ReferenceExecutor:
         mean_metrics = {k: _mean(k) for k in run_metrics[0]}
         score = composite_score(mean_metrics, weights)
         per_run_scores = tuple(composite_score(m, weights) for m in run_metrics)
+        per_category = {
+            category: {
+                "quality": totals["quality"] / (category_counts[category] * len(run_metrics)),
+                "failure_rate": totals["failed"] / (category_counts[category] * len(run_metrics)),
+                "count": category_counts[category],
+            }
+            for category, totals in per_category_totals.items()
+        }
 
         return HarnessEvaluation(
             genome_id=genome.genome_id,
@@ -281,11 +295,15 @@ class ReferenceExecutor:
             latency=mean_metrics["latency"],
             failure_rate=mean_metrics["failure_rate"],
             score=score,
-            per_category=per_category_acc,
+            per_category=per_category,
             failure_categories=tuple(failure_categories_ordered),
             run_count=len(run_metrics),
             per_run_scores=per_run_scores,
-            raw={"benchmark_cases": len(cases), "task_type": genome.task_type},
+            raw={
+                "benchmark_cases": len(cases),
+                "task_type": genome.task_type,
+                "per_run_quality": [m["quality"] for m in run_metrics],
+            },
         )
 
 
@@ -295,13 +313,6 @@ def caps_robustness(caps: _Capabilities) -> float:
 
 def caps_verifier(caps: _Capabilities) -> float:
     return _clamp01(0.20 + 0.40 * (1.0 if caps.has_verifier else 0.0) + 0.20 * (1.0 if caps.output_strict else 0.0) + 0.20 * (1.0 if caps.independent_verifier else 0.0))
-
-
-def _stable_hash(text: str) -> int:
-    h = 0
-    for ch in text:
-        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
-    return h
 
 
 def _clamp01(x: float) -> float:
@@ -318,17 +329,25 @@ def parallel_evaluate(
     weights: ScoreWeights | None = None,
     max_workers: int | None = None,
 ) -> list[HarnessEvaluation]:
-    """Evaluate genomes concurrently with matched seeds (paired comparison)."""
+    """Evaluate genomes with matched seeds, using concurrency for external executors."""
     if not genomes:
         return []
-    workers = max(1, min(max_workers or len(genomes), len(genomes)))
+    reference_executor = isinstance(executor, ReferenceExecutor)
+    if reference_executor:
+        benchmark = _PreparedBenchmark(tuple(_benchmark_cases(benchmark)))
+    default_workers = 1 if reference_executor else len(genomes)
+    workers = max(1, min(max_workers or default_workers, len(genomes)))
     results: list[HarnessEvaluation | None] = [None] * len(genomes)
 
     def _job(idx: int) -> None:
         results[idx] = executor.evaluate(genomes[idx], benchmark, seed=seed, repeated_runs=repeated_runs, weights=weights)
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(_job, range(len(genomes))))
+    if workers == 1:
+        for idx in range(len(genomes)):
+            _job(idx)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_job, range(len(genomes))))
     return [r for r in results if r is not None]
 
 

@@ -35,11 +35,24 @@ def compare_experiment(report: Mapping[str, Any], output_dir: str | Path) -> dic
     return comparison
 
 
-def create_rollback_snapshot(component: str, version: str, output_dir: str | Path) -> Path:
+def create_rollback_snapshot(
+    component: str,
+    version: str,
+    output_dir: str | Path,
+    *,
+    state: Mapping[str, Any] | None = None,
+) -> Path:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{component}_{version}_rollback.json"
-    path.write_text(json.dumps({"component": component, "version": version, "created_at": datetime.now(timezone.utc).isoformat()}, indent=2) + "\n", encoding="utf-8")
+    payload = {
+        "component": component,
+        "version": version,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if state is not None:
+        payload["state"] = dict(state)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 
